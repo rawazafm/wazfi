@@ -54,8 +54,12 @@ pub struct Network {
 }
 
 fn sh(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
+    // Resolve the program ourselves — GUI-launched apps often get a minimal
+    // PATH without /sbin:/usr/sbin where iw/ip/airmon-ng live.
+    let prog = which(cmd).unwrap_or_else(|| cmd.to_string());
+    Command::new(prog)
         .args(args)
+        .env("PATH", augmented_path())
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -87,15 +91,24 @@ fn augmented_path() -> String {
 }
 
 fn which(tool: &str) -> Option<String> {
-    if let Some(s) = sh("which", &[tool]) {
-        let t = s.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
-        }
+    // Absolute path given.
+    if tool.contains('/') {
+        return std::path::Path::new(tool)
+            .exists()
+            .then(|| tool.to_string());
     }
-    // Fallback: probe standard locations directly (packaged-app PATH is minimal).
-    for dir in EXTRA_PATHS {
-        let cand = format!("{dir}/{tool}");
+    // Search the inherited PATH first, then the standard locations. This does
+    // NOT shell out to `which` (that would recurse through `sh`) and it covers
+    // the minimal PATH a GUI-launched app receives.
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("PATH") {
+        dirs.extend(p.split(':').filter(|s| !s.is_empty()).map(str::to_string));
+    }
+    for d in EXTRA_PATHS {
+        dirs.push((*d).to_string());
+    }
+    for d in dirs {
+        let cand = format!("{d}/{tool}");
         if std::path::Path::new(&cand).exists() {
             return Some(cand);
         }
