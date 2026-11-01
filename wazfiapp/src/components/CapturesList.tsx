@@ -96,13 +96,19 @@ export function CapturesList() {
                     </span>
                   </div>
                 </div>
+                {c.kind === "pmkid" && (
+                  <Badge className="border-violet-500/30 bg-violet-500/10 text-violet-300">
+                    PMKID
+                  </Badge>
+                )}
                 {c.has_handshake ? (
                   <Badge className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
-                    <Check className="h-3 w-3" /> handshake
+                    <Check className="h-3 w-3" />{" "}
+                    {c.kind === "pmkid" ? "crackable" : "handshake"}
                   </Badge>
                 ) : (
                   <Badge className="border-border bg-muted/40 text-muted-foreground">
-                    no handshake
+                    {c.kind === "pmkid" ? "no PMKID" : "no handshake"}
                   </Badge>
                 )}
                 <Button

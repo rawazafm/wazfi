@@ -1378,20 +1378,21 @@ fn stop_attack(state: State<AttackState>, job: String) -> Result<(), String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    // The real tool may be a grandchild of sudo; signal it by name too.
-    let tool = match job.as_str() {
-        "deauth" | "deauth_aireplay" => "aireplay-ng",
-        "capture" => "airodump-ng",
-        "wordlist" => "crunch",
-        "crack" => "aircrack-ng",
-        "deauth_mdk4" | "beacon" | "michael" | "wids" => "mdk4",
-        "wps_scan" => "wash",
-        "wps_pixie" | "wps_bruteforce" | "wps_nullpin" => "reaver",
-        "wep_besside" => "besside-ng",
-        "pmkid" => "hcxdumptool",
-        _ => "",
+    // The real tool may be a grandchild of sudo/bash; signal it by name too.
+    // The crack job can be either aircrack-ng (handshake) or hashcat (PMKID).
+    let tools: &[&str] = match job.as_str() {
+        "deauth" | "deauth_aireplay" => &["aireplay-ng"],
+        "capture" => &["airodump-ng"],
+        "wordlist" => &["crunch"],
+        "crack" => &["aircrack-ng", "hashcat"],
+        "deauth_mdk4" | "beacon" | "michael" | "wids" => &["mdk4"],
+        "wps_scan" => &["wash"],
+        "wps_pixie" | "wps_bruteforce" | "wps_nullpin" => &["reaver"],
+        "wep_besside" => &["besside-ng"],
+        "pmkid" => &["hcxdumptool"],
+        _ => &[],
     };
-    if !tool.is_empty() {
+    for tool in tools {
         let _ = sudo_sh(&["pkill", "-TERM", "-x", tool]);
     }
     Ok(())
@@ -1407,12 +1408,78 @@ pub struct CaptureFile {
     path: String,
     size: u64,
     modified: u64,
+    /// true when the file holds something crackable (a 4-way handshake for
+    /// `.cap`, or a PMKID/EAPOL for `.pcapng`/`.pcap`).
     has_handshake: bool,
+    /// "handshake" (aircrack-ng / `.cap`) or "pmkid" (hashcat / `.pcapng`).
+    kind: String,
 }
 
 fn captures_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     format!("{home}/wazfi-captures")
+}
+
+/// Convert an hcxdumptool `.pcapng`/`.pcap` capture into a hashcat mode-22000
+/// hash file, returning its path when it contains at least one PMKID/EAPOL.
+/// The hash file is written alongside the capture as `<cap>.22000`.
+fn convert_pmkid(cap: &str) -> Option<String> {
+    let tool = which("hcxpcapngtool")?;
+    let out = format!("{cap}.22000");
+    let _ = std::fs::remove_file(&out);
+    let ok = Command::new(tool)
+        .arg("-o")
+        .arg(&out)
+        .arg(cap)
+        .env("PATH", augmented_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let has = ok
+        && std::fs::metadata(&out)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    if has {
+        Some(out)
+    } else {
+        let _ = std::fs::remove_file(&out);
+        None
+    }
+}
+
+/// Does a pcapng/pcap capture contain a crackable PMKID/EAPOL? Checked by a
+/// throwaway conversion into a temp file (reading a capture is unprivileged).
+fn pcapng_crackable(cap: &str) -> bool {
+    let tool = match which("hcxpcapngtool") {
+        Some(t) => t,
+        None => return false,
+    };
+    let name = std::path::Path::new(cap)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cap");
+    let tmp = std::env::temp_dir().join(format!("wazfi_chk_{name}.22000"));
+    let _ = std::fs::remove_file(&tmp);
+    let ok = Command::new(tool)
+        .arg("-o")
+        .arg(&tmp)
+        .arg(cap)
+        .env("PATH", augmented_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let has = ok
+        && std::fs::metadata(&tmp)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    let _ = std::fs::remove_file(&tmp);
+    has
 }
 
 #[tauri::command]
@@ -1422,9 +1489,11 @@ fn list_captures() -> Vec<CaptureFile> {
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("cap") {
-                continue;
-            }
+            let kind = match p.extension().and_then(|x| x.to_str()) {
+                Some("cap") => "handshake",
+                Some("pcapng") | Some("pcap") => "pmkid",
+                _ => continue,
+            };
             let meta = e.metadata().ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = meta
@@ -1433,9 +1502,15 @@ fn list_captures() -> Vec<CaptureFile> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let path = p.to_string_lossy().to_string();
+            let has_handshake = if kind == "pmkid" {
+                pcapng_crackable(&path)
+            } else {
+                cap_has_handshake(&path)
+            };
             out.push(CaptureFile {
                 name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                has_handshake: cap_has_handshake(&path),
+                has_handshake,
+                kind: kind.to_string(),
                 path,
                 size,
                 modified,
@@ -1451,6 +1526,12 @@ fn delete_capture(path: String) -> Result<(), String> {
     // Only allow deleting inside our captures dir.
     if !path.starts_with(&captures_dir()) {
         return Err("refusing to delete outside the captures folder".into());
+    }
+    // PMKID captures: remove the pcapng/pcap and its derived hashcat file.
+    if path.ends_with(".pcapng") || path.ends_with(".pcap") {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.22000"));
+        return Ok(());
     }
     // airodump writes companion files (.csv/.kismet/.netxml/.log) — remove them too.
     let stem = path.trim_end_matches(".cap");
@@ -1554,7 +1635,69 @@ fn list_wordlists() -> Vec<WordlistFile> {
     out
 }
 
-/// Dictionary attack with aircrack-ng (job "crack"). Streams output; the UI
+/// Spawn hashcat (mode 22000) via bash as the "crack" job. Streams progress as
+/// `attack-log`; the password is written by hashcat to `outfile`
+/// (`--outfile-format 2` = plaintext only). When hashcat's stdout closes we
+/// read `outfile` and emit a "KEY FOUND!" line (so the UI's existing matcher
+/// picks it up) or report that the wordlist was exhausted, then `attack-exit`.
+fn spawn_hashcat_crack(
+    app: &AppHandle,
+    bash_line: &str,
+    outfile: String,
+) -> Result<Child, String> {
+    let mut cmd = build_cmd("bash", &["-c", bash_line], false);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start hashcat: {e}"))?;
+
+    for (pipe, is_out) in [
+        (child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), true),
+        (child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), false),
+    ] {
+        if let Some(p) = pipe {
+            let a = app.clone();
+            let of = outfile.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(p).lines().map_while(Result::ok) {
+                    let clean = strip_ansi(&line);
+                    if clean.trim().is_empty() {
+                        continue;
+                    }
+                    let _ = a.emit(
+                        "attack-log",
+                        serde_json::json!({ "job": "crack", "line": clean }),
+                    );
+                }
+                if is_out {
+                    // hashcat has exited — the plaintext (if any) is in outfile.
+                    let key = std::fs::read_to_string(&of)
+                        .ok()
+                        .and_then(|c| {
+                            c.lines()
+                                .map(str::trim)
+                                .find(|l| !l.is_empty())
+                                .map(str::to_string)
+                        });
+                    let line = match key {
+                        Some(pw) => format!("KEY FOUND! [ {pw} ]"),
+                        None => "hashcat finished — key not found (wordlist exhausted)".to_string(),
+                    };
+                    let _ = a.emit(
+                        "attack-log",
+                        serde_json::json!({ "job": "crack", "line": line }),
+                    );
+                    let _ = a.emit("attack-exit", serde_json::json!({ "job": "crack" }));
+                }
+            });
+        }
+    }
+    Ok(child)
+}
+
+/// Dictionary attack against a handshake (`.cap`, aircrack-ng) or a PMKID/EAPOL
+/// capture (`.pcapng`/`.pcap`, converted with hcxpcapngtool then cracked with
+/// hashcat mode 22000). Runs as the "crack" job and streams output; the UI
 /// highlights the "KEY FOUND!" line.
 #[tauri::command]
 fn start_crack(
@@ -1563,13 +1706,48 @@ fn start_crack(
     cap: String,
     wordlist: String,
 ) -> Result<(), String> {
-    which("aircrack-ng").ok_or_else(|| "aircrack-ng not installed".to_string())?;
     if !std::path::Path::new(&cap).exists() {
         return Err(format!("capture not found: {cap}"));
     }
     if !std::path::Path::new(&wordlist).exists() {
         return Err(format!("wordlist not found: {wordlist}"));
     }
+
+    let shq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+
+    // PMKID / EAPOL capture → hcxpcapngtool + hashcat (mode 22000).
+    if cap.ends_with(".pcapng") || cap.ends_with(".pcap") {
+        which("hcxpcapngtool")
+            .ok_or_else(|| "hcxpcapngtool not installed (apt install hcxtools)".to_string())?;
+        which("hashcat").ok_or_else(|| "hashcat not installed (apt install hashcat)".to_string())?;
+        let hc = convert_pmkid(&cap)
+            .ok_or_else(|| "no PMKID/EAPOL message found in this capture".to_string())?;
+        let outfile = format!("{hc}.cracked");
+        let _ = std::fs::remove_file(&outfile);
+
+        // --outfile-format 2 = plaintext only; --potfile-disable so a previous
+        // run doesn't short-circuit and skip writing the outfile.
+        let hc_opts = format!(
+            "-m 22000 -a 0 --potfile-disable --outfile-format 2 -o {} --status --status-timer 10 {}",
+            shq(&outfile),
+            shq(&hc)
+        );
+        let bash_line = if wordlist.ends_with(".gz") {
+            // hashcat can't read gzip; feed candidates on stdin via zcat.
+            format!("zcat {} | hashcat {}", shq(&wordlist), hc_opts)
+        } else {
+            format!("hashcat {} {}", hc_opts, shq(&wordlist))
+        };
+        let _ = app.emit(
+            "attack-log",
+            serde_json::json!({ "job": "crack", "line": bash_line.clone() }),
+        );
+        let child = spawn_hashcat_crack(&app, &bash_line, outfile)?;
+        state.0.lock().unwrap().insert("crack".into(), child);
+        return Ok(());
+    }
+
+    which("aircrack-ng").ok_or_else(|| "aircrack-ng not installed".to_string())?;
     // Derive the BSSID from our capture filename (hs_<12 hex>_<ts>-01.cap) so
     // aircrack doesn't prompt for a target.
     let bssid = std::path::Path::new(&cap)
@@ -1590,7 +1768,6 @@ fn start_crack(
         });
 
     let bssid_flag = bssid.as_ref().map(|b| format!("-b {b} ")).unwrap_or_default();
-    let shq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
 
     let child = if wordlist.ends_with(".gz") {
         // aircrack can't read gzip directly — stream it through zcat.

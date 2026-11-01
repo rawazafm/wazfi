@@ -248,7 +248,10 @@ export interface CaptureFile {
   path: string;
   size: number;
   modified: number;
+  /** true when the file holds something crackable (4-way handshake or PMKID) */
   has_handshake: boolean;
+  /** "handshake" (aircrack-ng / .cap) or "pmkid" (hashcat / .pcapng) */
+  kind: "handshake" | "pmkid";
 }
 
 export async function listCaptures(): Promise<CaptureFile[]> {

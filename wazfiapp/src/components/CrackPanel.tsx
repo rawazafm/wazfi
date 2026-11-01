@@ -29,6 +29,9 @@ export function CrackPanel() {
 
   const running = attacks.includes("crack");
   const allWls = [...custom, ...wls];
+  const selectedCap = caps.find((c) => c.path === cap);
+  const isPmkid = selectedCap?.kind === "pmkid";
+  const engine = isPmkid ? "hashcat (mode 22000)" : "aircrack-ng";
 
   async function upload() {
     const path = await pickWordlist();
@@ -59,7 +62,10 @@ export function CrackPanel() {
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2 text-sm font-semibold">
             <KeyRound className="h-4 w-4 text-primary" />
-            Dictionary attack (aircrack-ng)
+            Dictionary attack
+            <span className="font-mono text-[11px] font-normal text-muted-foreground">
+              {engine}
+            </span>
           </div>
           <Button size="sm" variant="glass" onClick={load}>
             <RefreshCw className="h-3.5 w-3.5" /> Refresh
@@ -81,7 +87,7 @@ export function CrackPanel() {
         <div className="space-y-3">
           <div>
             <label className="mb-1 block text-[11px] text-muted-foreground">
-              Handshake capture
+              Handshake / PMKID capture
             </label>
             <Select
               value={cap}
@@ -89,10 +95,11 @@ export function CrackPanel() {
               disabled={running}
             >
               {caps.length === 0 && (
-                <option value="">no captures with a handshake</option>
+                <option value="">no crackable captures yet</option>
               )}
               {caps.map((c) => (
                 <option key={c.path} value={c.path}>
+                  {c.kind === "pmkid" ? "[PMKID] " : ""}
                   {c.name} ({human(c.size)})
                 </option>
               ))}
@@ -129,7 +136,9 @@ export function CrackPanel() {
 
           <div className="flex items-center justify-between">
             <span className="text-[11px] text-muted-foreground">
-              Cracks the handshake offline against the chosen wordlist.
+              {isPmkid
+                ? "Converts the PMKID with hcxpcapngtool and cracks it offline with hashcat."
+                : "Cracks the handshake offline against the chosen wordlist."}
             </span>
             {running ? (
               <Button
