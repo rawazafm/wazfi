@@ -35,6 +35,12 @@ function Boot() {
 function Shell() {
   const { booting, system } = useApp();
   const [active, setActive] = React.useState<ModuleId>("dashboard");
+  const mainRef = React.useRef<HTMLElement>(null);
+
+  // Always open a panel scrolled to the top.
+  React.useEffect(() => {
+    mainRef.current?.scrollTo({ top: 0 });
+  }, [active]);
 
   if (booting) return <Boot />;
 
@@ -83,7 +89,7 @@ function Shell() {
         </header>
 
         {/* Content */}
-        <main className="min-h-0 flex-1 overflow-y-auto p-6">
+        <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto p-6">
           <AnimatePresence mode="wait">
             <motion.div
               key={active}

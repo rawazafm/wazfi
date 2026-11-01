@@ -22,11 +22,24 @@ const LEVEL_PREFIX: Record<LogLine["level"], string> = {
 
 export function Console({ className }: { className?: string }) {
   const { logs } = useApp();
-  const endRef = React.useRef<HTMLDivElement>(null);
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const pinnedRef = React.useRef(true);
 
+  // Auto-scroll ONLY this console's own box (never the page). Using
+  // scrollIntoView would bubble up and scroll ancestor containers, yanking the
+  // whole app to the bottom while output streams.
   React.useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scrollRef.current;
+    if (el && pinnedRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [logs]);
+
+  // Only keep auto-scrolling while the user is near the bottom.
+  function onScroll(e: React.UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
 
   return (
     <div className={cn("glass flex flex-col overflow-hidden rounded-xl", className)}>
@@ -42,7 +55,11 @@ export function Console({ className }: { className?: string }) {
           <Trash2 className="h-3.5 w-3.5 opacity-50" />
         </Button>
       </div>
-      <div className="relative flex-1 overflow-y-auto p-3 font-mono text-[12px] leading-relaxed">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="relative flex-1 overflow-y-auto overscroll-contain p-3 font-mono text-[12px] leading-relaxed"
+      >
         {logs.length === 0 && (
           <div className="text-muted-foreground">waiting for activity…</div>
         )}
@@ -55,7 +72,6 @@ export function Console({ className }: { className?: string }) {
             <span className="break-all text-foreground/90">{l.text}</span>
           </div>
         ))}
-        <div ref={endRef} />
       </div>
     </div>
   );
