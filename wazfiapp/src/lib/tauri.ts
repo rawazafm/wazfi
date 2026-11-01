@@ -208,13 +208,16 @@ export async function installTools(targets: string[]): Promise<void> {
 
 /* ------------------------------ live attacks ----------------------------- */
 
-export async function startDeauth(
+/** Launch a single-process attack by kind (DoS / WPS / WEP / PMKID). */
+export async function runAttack(
+  kind: string,
   iface: string,
   bssid: string,
   channel: number,
+  essid: string,
 ): Promise<void> {
   const invoke = await requireInvoke();
-  await invoke("start_deauth", { iface, bssid, channel });
+  await invoke("run_attack", { kind, iface, bssid, channel, essid });
 }
 
 /** Returns the capture file path. */

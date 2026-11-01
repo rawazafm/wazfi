@@ -10,9 +10,9 @@ import {
   listInterfaces,
   scanNetworks,
   setMonitorMode,
+  runAttack,
   startCapture,
   startCrack,
-  startDeauth,
   stopAttack as stopAttackCmd,
   isTauri,
   type Network,
@@ -61,7 +61,13 @@ interface AppState {
   log: (level: LogLine["level"], text: string) => void;
   refresh: () => Promise<void>;
   installTools: () => Promise<void>;
-  launchDeauth: (iface: string, bssid: string, channel: number) => Promise<void>;
+  launchAttack: (
+    kind: string,
+    iface: string,
+    bssid: string,
+    channel: number,
+    essid: string,
+  ) => Promise<void>;
   launchCapture: (iface: string, bssid: string, channel: number) => Promise<void>;
   launchWordlist: (opts: WordlistOpts) => Promise<void>;
   launchCrack: (cap: string, wordlist: string) => Promise<void>;
@@ -295,14 +301,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   }, [log]);
 
-  const launchDeauth = React.useCallback(
-    async (iface: string, bssid: string, channel: number) => {
-      log("cmd", `deauth ${bssid} on ch ${channel}`);
+  const launchAttack = React.useCallback(
+    async (
+      kind: string,
+      iface: string,
+      bssid: string,
+      channel: number,
+      essid: string,
+    ) => {
+      log("cmd", `${kind} on ${bssid || essid || iface} (ch ${channel})`);
       try {
-        await startDeauth(iface, bssid, channel);
-        setAttacks((a) => (a.includes("deauth") ? a : [...a, "deauth"]));
+        await runAttack(kind, iface, bssid, channel, essid);
+        setAttacks((a) => (a.includes(kind) ? a : [...a, kind]));
       } catch (e) {
-        log("err", `deauth failed: ${String(e)}`);
+        log("err", `${kind} failed: ${String(e)}`);
       }
     },
     [log],
@@ -411,7 +423,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     log,
     refresh,
     installTools,
-    launchDeauth,
+    launchAttack,
     launchCapture,
     launchWordlist,
     launchCrack,

@@ -27,7 +27,7 @@ export function ModulePanel({ module }: { module: AppModule }) {
     tools,
     log,
     attacks,
-    launchDeauth,
+    launchAttack,
     launchCapture,
     stopAttack,
   } = useApp();
@@ -41,33 +41,56 @@ export function ModulePanel({ module }: { module: AppModule }) {
 
   const installed = new Set(tools.filter((t) => t.installed).map((t) => t.name));
 
-  // Actions wired to real execution (the rest are previews for now).
-  function implementedJob(action: AttackAction): "deauth" | "capture" | null {
-    const key = `${module.id}:${action.id}`;
-    if (key === "dos:deauth_aireplay") return "deauth";
-    if (key === "handshake:capture_handshake") return "capture";
-    return null;
+  // Map each wired action to its backend job id (others stay preview).
+  const WIRED: Record<string, string> = {
+    "dos:deauth_aireplay": "deauth_aireplay",
+    "dos:deauth_mdk4": "deauth_mdk4",
+    "dos:beacon": "beacon",
+    "dos:michael": "michael",
+    "dos:wids": "wids",
+    "handshake:capture_handshake": "capture",
+    "handshake:capture_pmkid": "pmkid",
+    "wps:scan": "wps_scan",
+    "wps:pixie": "wps_pixie",
+    "wps:bruteforce": "wps_bruteforce",
+    "wps:nullpin": "wps_nullpin",
+    "wep:besside": "wep_besside",
+  };
+  // Jobs that don't need a selected target.
+  const NO_TARGET = new Set(["beacon", "wids", "wps_scan", "pmkid"]);
+
+  function implementedJob(action: AttackAction): string | null {
+    return WIRED[`${module.id}:${action.id}`] ?? null;
   }
 
   function launch(action: AttackAction) {
     const job = implementedJob(action);
 
-    if (needsTarget && !target) {
-      log("err", `${module.label}: select a target network first`);
-      return;
-    }
-
     if (job) {
-      // Real execution — the backend puts the adapter into monitor mode itself.
       if (!selectedIface) {
         log("err", "select an interface first");
         return;
       }
-      if (job === "deauth") {
-        void launchDeauth(selectedIface, target!.bssid, target!.channel);
-      } else {
-        void launchCapture(selectedIface, target!.bssid, target!.channel);
+      if (needsTarget && !target && !NO_TARGET.has(job)) {
+        log("err", `${module.label}: select a target network first`);
+        return;
       }
+      if (job === "capture") {
+        void launchCapture(selectedIface, target!.bssid, target!.channel);
+      } else {
+        void launchAttack(
+          job,
+          selectedIface,
+          target?.bssid ?? "",
+          target?.channel ?? 0,
+          target?.essid ?? "",
+        );
+      }
+      return;
+    }
+
+    if (needsTarget && !target) {
+      log("err", `${module.label}: select a target network first`);
       return;
     }
 
