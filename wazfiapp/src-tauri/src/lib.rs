@@ -1306,6 +1306,7 @@ fn stop_attack(state: State<AttackState>, job: String) -> Result<(), String> {
         "deauth" => "aireplay-ng",
         "capture" => "airodump-ng",
         "wordlist" => "crunch",
+        "crack" => "aircrack-ng",
         _ => "",
     };
     if !tool.is_empty() {
@@ -1413,18 +1414,113 @@ fn generate_wordlist(
         args.push("-t".into());
         args.push(pattern);
     }
-    args.push("-o".into());
-    args.push(out.clone());
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-
     let _ = app.emit(
         "attack-log",
-        serde_json::json!({ "job": "wordlist", "line": format!("crunch {}", args_ref.join(" ")) }),
+        serde_json::json!({ "job": "wordlist", "line": format!("crunch {} > {}", args_ref.join(" "), out) }),
     );
-    // crunch is unprivileged → don't wrap in sudo (keeps the file user-owned).
-    let child = spawn_streamed(&app, "wordlist", "crunch", &args_ref, false)?;
+
+    // Redirect crunch's stdout to the file ourselves instead of using `-o`
+    // (crunch's -o rename step is buggy); progress comes on stderr.
+    let f = std::fs::File::create(&out).map_err(|e| format!("cannot create {out}: {e}"))?;
+    let mut cmd = build_cmd("crunch", &args_ref, false);
+    cmd.stdout(Stdio::from(f)).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start crunch: {e}"))?;
+    if let Some(err) = child.stderr.take() {
+        let a = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let clean = strip_ansi(&line);
+                if !clean.trim().is_empty() {
+                    let _ = a.emit("attack-log", serde_json::json!({ "job": "wordlist", "line": clean }));
+                }
+            }
+            let _ = a.emit("attack-exit", serde_json::json!({ "job": "wordlist" }));
+        });
+    }
     state.0.lock().unwrap().insert("wordlist".into(), child);
     Ok(out)
+}
+
+#[derive(Serialize)]
+pub struct WordlistFile {
+    name: String,
+    path: String,
+    size: u64,
+}
+
+#[tauri::command]
+fn list_wordlists() -> Vec<WordlistFile> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let mut out = Vec::new();
+    for dir in [format!("{home}/wazfi-wordlists"), "/usr/share/wordlists".to_string()] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    out.push(WordlistFile {
+                        name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        path: p.to_string_lossy().to_string(),
+                        size: e.metadata().map(|m| m.len()).unwrap_or(0),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Dictionary attack with aircrack-ng (job "crack"). Streams output; the UI
+/// highlights the "KEY FOUND!" line.
+#[tauri::command]
+fn start_crack(
+    app: AppHandle,
+    state: State<AttackState>,
+    cap: String,
+    wordlist: String,
+) -> Result<(), String> {
+    which("aircrack-ng").ok_or_else(|| "aircrack-ng not installed".to_string())?;
+    if !std::path::Path::new(&cap).exists() {
+        return Err(format!("capture not found: {cap}"));
+    }
+    if !std::path::Path::new(&wordlist).exists() {
+        return Err(format!("wordlist not found: {wordlist}"));
+    }
+    // Derive the BSSID from our capture filename (hs_<12 hex>_<ts>-01.cap) so
+    // aircrack doesn't prompt for a target.
+    let bssid = std::path::Path::new(&cap)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .and_then(|n| n.strip_prefix("hs_"))
+        .and_then(|r| r.split('_').next())
+        .filter(|m| m.len() == 12 && m.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|m| {
+            let mut s = String::new();
+            for (i, c) in m.chars().enumerate() {
+                if i > 0 && i % 2 == 0 {
+                    s.push(':');
+                }
+                s.push(c);
+            }
+            s.to_uppercase()
+        });
+
+    let mut args: Vec<String> = vec!["-w".into(), wordlist];
+    if let Some(b) = &bssid {
+        args.push("-b".into());
+        args.push(b.clone());
+    }
+    args.push(cap);
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    let _ = app.emit(
+        "attack-log",
+        serde_json::json!({ "job": "crack", "line": format!("aircrack-ng {}", args_ref.join(" ")) }),
+    );
+    let child = spawn_streamed(&app, "crack", "aircrack-ng", &args_ref, false)?;
+    state.0.lock().unwrap().insert("crack".into(), child);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1461,7 +1557,9 @@ pub fn run() {
             attack_status,
             list_captures,
             delete_capture,
-            generate_wordlist
+            generate_wordlist,
+            list_wordlists,
+            start_crack
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

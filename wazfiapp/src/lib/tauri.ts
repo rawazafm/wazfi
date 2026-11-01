@@ -272,3 +272,21 @@ export async function generateWordlist(opts: WordlistOpts): Promise<string> {
   const invoke = await requireInvoke();
   return invoke<string>("generate_wordlist", { ...opts });
 }
+
+export interface WordlistFile {
+  name: string;
+  path: string;
+  size: number;
+}
+
+export async function listWordlists(): Promise<WordlistFile[]> {
+  const invoke = await getInvoke();
+  if (!invoke) return [];
+  return invoke<WordlistFile[]>("list_wordlists");
+}
+
+/** Dictionary attack with aircrack-ng (runs as the "crack" job). */
+export async function startCrack(cap: string, wordlist: string): Promise<void> {
+  const invoke = await requireInvoke();
+  await invoke("start_crack", { cap, wordlist });
+}

@@ -2,7 +2,6 @@ import * as React from "react";
 import { Wand2, Play, Square, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useApp } from "@/store";
-import { generateWordlist } from "@/lib/tauri";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,7 +35,7 @@ function estimate(charsetLen: number, max: number): string {
 }
 
 export function WordlistGenerator() {
-  const { attacks, stopAttack, log } = useApp();
+  const { attacks, stopAttack, launchWordlist } = useApp();
   const [preset, setPreset] = React.useState("lowerdigits");
   const [custom, setCustom] = React.useState("");
   const [min, setMin] = React.useState("8");
@@ -56,16 +55,7 @@ export function WordlistGenerator() {
   async function generate() {
     setBusy(true);
     try {
-      const out = await generateWordlist({
-        charset,
-        min: minN,
-        max: maxN,
-        pattern,
-        name,
-      });
-      log("ok", `wordlist → ${out}`);
-    } catch (e) {
-      log("err", `wordlist failed: ${String(e)}`);
+      await launchWordlist({ charset, min: minN, max: maxN, pattern, name });
     } finally {
       setBusy(false);
     }

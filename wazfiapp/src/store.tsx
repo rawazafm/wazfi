@@ -4,12 +4,14 @@ import {
   checkPrereqs,
   checkTools,
   detectUsbWifi,
+  generateWordlist,
   getSystemInfo,
   installTools as installToolsCmd,
   listInterfaces,
   scanNetworks,
   setMonitorMode,
   startCapture,
+  startCrack,
   startDeauth,
   stopAttack as stopAttackCmd,
   isTauri,
@@ -19,6 +21,7 @@ import {
   type ToolStatus,
   type UsbWifi,
   type WifiInterface,
+  type WordlistOpts,
 } from "@/lib/tauri";
 
 export interface LogLine {
@@ -45,9 +48,11 @@ interface AppState {
   installing: boolean;
   canInstall: boolean;
 
-  /** live attacks: job ids currently running ("deauth", "capture") */
+  /** live attacks: job ids currently running ("deauth", "capture", "wordlist", "crack") */
   attacks: string[];
   lastCapture: string | null;
+  /** recovered WPA key from a crack, if any */
+  crackKey: string | null;
 
   selectIface: (name: string) => void;
   selectTarget: (id: string | null) => void;
@@ -58,6 +63,8 @@ interface AppState {
   installTools: () => Promise<void>;
   launchDeauth: (iface: string, bssid: string, channel: number) => Promise<void>;
   launchCapture: (iface: string, bssid: string, channel: number) => Promise<void>;
+  launchWordlist: (opts: WordlistOpts) => Promise<void>;
+  launchCrack: (cap: string, wordlist: string) => Promise<void>;
   stopAttack: (job: string) => Promise<void>;
 }
 
@@ -80,6 +87,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [installing, setInstalling] = React.useState(false);
   const [attacks, setAttacks] = React.useState<string[]>([]);
   const [lastCapture, setLastCapture] = React.useState<string | null>(null);
+  const [crackKey, setCrackKey] = React.useState<string | null>(null);
 
   const log = React.useCallback((level: LogLine["level"], text: string) => {
     const ts = new Date().toLocaleTimeString("en-GB");
@@ -255,7 +263,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const { listen } = await import("@tauri-apps/api/event");
       offLog = await listen<{ job: string; line: string }>("attack-log", (e) => {
         const { job, line } = e.payload;
-        if (line?.trim()) log("info", `${job}: ${line}`);
+        if (!line?.trim()) return;
+        // aircrack prints "KEY FOUND! [ the-password ]"
+        if (/KEY FOUND/i.test(line)) {
+          const m = line.match(/\[\s*(.*?)\s*\]/);
+          if (m) setCrackKey(m[1]);
+          log("ok", line);
+        } else {
+          log("info", `${job}: ${line}`);
+        }
       });
       offExit = await listen<{ job: string }>("attack-exit", (e) => {
         setAttacks((a) => a.filter((j) => j !== e.payload.job));
@@ -301,6 +317,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         log("info", `writing capture to ${file}`);
       } catch (e) {
         log("err", `capture failed: ${String(e)}`);
+      }
+    },
+    [log],
+  );
+
+  const launchWordlist = React.useCallback(
+    async (opts: WordlistOpts) => {
+      log("cmd", `generate wordlist "${opts.name}" (len ${opts.min}-${opts.max})`);
+      try {
+        const file = await generateWordlist(opts);
+        setAttacks((a) => (a.includes("wordlist") ? a : [...a, "wordlist"]));
+        log("info", `generating → ${file}`);
+      } catch (e) {
+        log("err", `wordlist failed: ${String(e)}`);
+      }
+    },
+    [log],
+  );
+
+  const launchCrack = React.useCallback(
+    async (cap: string, wordlist: string) => {
+      setCrackKey(null);
+      log("cmd", `crack ${cap} with ${wordlist}`);
+      try {
+        await startCrack(cap, wordlist);
+        setAttacks((a) => (a.includes("crack") ? a : [...a, "crack"]));
+      } catch (e) {
+        log("err", `crack failed: ${String(e)}`);
       }
     },
     [log],
@@ -359,6 +403,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     canInstall: !!prereqs?.pkg_manager,
     attacks,
     lastCapture,
+    crackKey,
     selectIface,
     selectTarget,
     toggleMonitor,
@@ -368,6 +413,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     installTools,
     launchDeauth,
     launchCapture,
+    launchWordlist,
+    launchCrack,
     stopAttack,
   };
 

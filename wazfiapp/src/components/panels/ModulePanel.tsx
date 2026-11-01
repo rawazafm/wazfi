@@ -16,6 +16,7 @@ import { NetworkTable } from "@/components/NetworkTable";
 import { Console } from "@/components/Console";
 import { CapturesList } from "@/components/CapturesList";
 import { WordlistGenerator } from "@/components/WordlistGenerator";
+import { CrackPanel } from "@/components/CrackPanel";
 
 export function ModulePanel({ module }: { module: AppModule }) {
   const {
@@ -170,6 +171,7 @@ export function ModulePanel({ module }: { module: AppModule }) {
             </Card>
           )}
 
+          {module.id === "decrypt" && <CrackPanel />}
           {module.id === "decrypt" && <WordlistGenerator />}
           {(module.id === "handshake" || module.id === "decrypt") && (
             <CapturesList />
