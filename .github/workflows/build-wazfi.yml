@@ -30,6 +30,8 @@ jobs:
         include:
           - runner: ubuntu-22.04
             arch: amd64
+          # free arm64 runner (public repos) — builds the arm64 .deb/.AppImage
+          # for an Apple Silicon Parrot/Kali VM
           - runner: ubuntu-22.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
