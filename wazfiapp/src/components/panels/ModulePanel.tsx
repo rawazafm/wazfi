@@ -14,6 +14,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { NetworkTable } from "@/components/NetworkTable";
 import { Console } from "@/components/Console";
+import { CapturesList } from "@/components/CapturesList";
+import { WordlistGenerator } from "@/components/WordlistGenerator";
 
 export function ModulePanel({ module }: { module: AppModule }) {
   const {
@@ -166,6 +168,11 @@ export function ModulePanel({ module }: { module: AppModule }) {
                 )}
               </CardContent>
             </Card>
+          )}
+
+          {module.id === "decrypt" && <WordlistGenerator />}
+          {(module.id === "handshake" || module.id === "decrypt") && (
+            <CapturesList />
           )}
 
           <div className="grid gap-3">

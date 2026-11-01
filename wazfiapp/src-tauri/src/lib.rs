@@ -1093,28 +1093,57 @@ fn ensure_monitor(iface: &str, channel: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove ANSI/VT escape sequences (airodump & friends redraw with them).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn build_cmd(program: &str, args: &[&str], privileged: bool) -> Command {
+    let prog = which(program).unwrap_or_else(|| program.to_string());
+    let mut cmd = if privileged && !is_root() {
+        let sudo = which("sudo").unwrap_or_else(|| "sudo".into());
+        let mut c = Command::new(sudo);
+        c.arg("-n").arg(&prog).args(args);
+        c
+    } else {
+        let mut c = Command::new(&prog);
+        c.args(args);
+        c
+    };
+    cmd.env("PATH", augmented_path());
+    cmd
+}
+
 /// Spawn a long-running tool, streaming stdout/stderr as `attack-log` events
-/// tagged with the job id; emits `attack-exit` when stdout closes.
+/// (ANSI stripped) tagged with the job id; emits `attack-exit` on stdout close.
 fn spawn_streamed(
     app: &AppHandle,
     job: &str,
     program: &str,
     args: &[&str],
+    privileged: bool,
 ) -> Result<Child, String> {
-    let prog = which(program).unwrap_or_else(|| program.to_string());
-    let mut cmd = if is_root() {
-        let mut c = Command::new(&prog);
-        c.args(args);
-        c
-    } else {
-        let sudo = which("sudo").unwrap_or_else(|| "sudo".into());
-        let mut c = Command::new(sudo);
-        c.arg("-n").arg(&prog).args(args);
-        c
-    };
-    cmd.env("PATH", augmented_path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = build_cmd(program, args, privileged);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start {program}: {e}"))?;
@@ -1128,7 +1157,11 @@ fn spawn_streamed(
             let j = job.to_string();
             std::thread::spawn(move || {
                 for line in BufReader::new(p).lines().map_while(Result::ok) {
-                    let _ = a.emit("attack-log", serde_json::json!({ "job": j, "line": line }));
+                    let clean = strip_ansi(&line);
+                    if clean.trim().is_empty() {
+                        continue;
+                    }
+                    let _ = a.emit("attack-log", serde_json::json!({ "job": j, "line": clean }));
                 }
                 if is_out {
                     let _ = a.emit("attack-exit", serde_json::json!({ "job": j }));
@@ -1137,6 +1170,15 @@ fn spawn_streamed(
         }
     }
     Ok(child)
+}
+
+/// Spawn a privileged background tool whose (noisy, redrawing) output we discard.
+fn spawn_quiet_priv(program: &str, args: &[&str]) -> Result<Child, String> {
+    build_cmd(program, args, true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start {program}: {e}"))
 }
 
 /// Does the capture file contain at least one captured handshake?
@@ -1188,6 +1230,7 @@ fn start_deauth(
         "deauth",
         "aireplay-ng",
         &["--deauth", "0", "-a", &bssid, &iface],
+        true,
     )?;
     state.0.lock().unwrap().insert("deauth".into(), child);
     Ok(())
@@ -1217,19 +1260,19 @@ fn start_capture(
         "attack-log",
         serde_json::json!({ "job": "capture", "line": format!("airodump-ng -c {channel} --bssid {bssid} -w {prefix} {iface}") }),
     );
-    let child = spawn_streamed(
-        &app,
-        "capture",
+    // airodump-ng redraws a full-screen table with escape codes, so we discard
+    // its output and report concise status from the capture-file watcher.
+    let child = spawn_quiet_priv(
         "airodump-ng",
         &["-c", &ch, "--bssid", &bssid, "-w", &prefix, &iface],
     )?;
     state.0.lock().unwrap().insert("capture".into(), child);
 
-    // Watch the capture file for a handshake.
+    // Watch the capture file for a handshake; report progress periodically.
     let a = app.clone();
     let capf = cap.clone();
     std::thread::spawn(move || {
-        for _ in 0..180 {
+        for tick in 1..=180u32 {
             std::thread::sleep(Duration::from_secs(4));
             if std::path::Path::new(&capf).exists() && cap_has_handshake(&capf) {
                 let _ = a.emit(
@@ -1237,7 +1280,15 @@ fn start_capture(
                     serde_json::json!({ "job": "capture", "line": format!("4-way handshake captured → {capf}") }),
                 );
                 let _ = a.emit("handshake-captured", serde_json::json!({ "file": capf }));
+                let _ = a.emit("attack-exit", serde_json::json!({ "job": "capture" }));
+                kill_attack_tools(); // auto-stop airodump
                 break;
+            }
+            if tick % 4 == 0 {
+                let _ = a.emit(
+                    "attack-log",
+                    serde_json::json!({ "job": "capture", "line": "capturing… waiting for a handshake (run Deauth to force a client to reconnect)" }),
+                );
             }
         }
     });
@@ -1254,12 +1305,126 @@ fn stop_attack(state: State<AttackState>, job: String) -> Result<(), String> {
     let tool = match job.as_str() {
         "deauth" => "aireplay-ng",
         "capture" => "airodump-ng",
+        "wordlist" => "crunch",
         _ => "",
     };
     if !tool.is_empty() {
         let _ = sudo_sh(&["pkill", "-TERM", "-x", tool]);
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------------- //
+// Captures + wordlist generation
+// --------------------------------------------------------------------------- //
+
+#[derive(Serialize)]
+pub struct CaptureFile {
+    name: String,
+    path: String,
+    size: u64,
+    modified: u64,
+    has_handshake: bool,
+}
+
+fn captures_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    format!("{home}/wazfi-captures")
+}
+
+#[tauri::command]
+fn list_captures() -> Vec<CaptureFile> {
+    let dir = captures_dir();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("cap") {
+                continue;
+            }
+            let meta = e.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let path = p.to_string_lossy().to_string();
+            out.push(CaptureFile {
+                name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                has_handshake: cap_has_handshake(&path),
+                path,
+                size,
+                modified,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+#[tauri::command]
+fn delete_capture(path: String) -> Result<(), String> {
+    // Only allow deleting inside our captures dir.
+    if !path.starts_with(&captures_dir()) {
+        return Err("refusing to delete outside the captures folder".into());
+    }
+    // airodump writes companion files (.csv/.kismet/.netxml/.log) — remove them too.
+    let stem = path.trim_end_matches(".cap");
+    for ext in [".cap", ".csv", ".kismet.csv", ".kismet.netxml", ".log.csv"] {
+        let _ = std::fs::remove_file(format!("{stem}{ext}"));
+    }
+    Ok(())
+}
+
+/// Generate a wordlist with crunch. Runs as the `wordlist` job so it streams to
+/// the console and can be stopped. Returns the output path.
+#[tauri::command]
+fn generate_wordlist(
+    app: AppHandle,
+    state: State<AttackState>,
+    charset: String,
+    min: u32,
+    max: u32,
+    pattern: String,
+    name: String,
+) -> Result<String, String> {
+    which("crunch").ok_or_else(|| "crunch not installed (apt install crunch)".to_string())?;
+    if min == 0 || max == 0 || max < min || max > 20 {
+        return Err("invalid length range (1..=20, max ≥ min)".into());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let dir = format!("{home}/wazfi-wordlists");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let safe = if safe.is_empty() { "wordlist".to_string() } else { safe };
+    let out = format!("{dir}/{safe}.txt");
+
+    let min_s = min.to_string();
+    let max_s = max.to_string();
+    let mut args: Vec<String> = vec![min_s, max_s];
+    if !charset.trim().is_empty() {
+        args.push(charset);
+    }
+    if !pattern.trim().is_empty() {
+        args.push("-t".into());
+        args.push(pattern);
+    }
+    args.push("-o".into());
+    args.push(out.clone());
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let _ = app.emit(
+        "attack-log",
+        serde_json::json!({ "job": "wordlist", "line": format!("crunch {}", args_ref.join(" ")) }),
+    );
+    // crunch is unprivileged → don't wrap in sudo (keeps the file user-owned).
+    let child = spawn_streamed(&app, "wordlist", "crunch", &args_ref, false)?;
+    state.0.lock().unwrap().insert("wordlist".into(), child);
+    Ok(out)
 }
 
 #[tauri::command]
@@ -1293,7 +1458,10 @@ pub fn run() {
             start_deauth,
             start_capture,
             stop_attack,
-            attack_status
+            attack_status,
+            list_captures,
+            delete_capture,
+            generate_wordlist
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

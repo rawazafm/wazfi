@@ -237,3 +237,38 @@ export async function attackStatus(): Promise<string[]> {
   if (!invoke) return [];
   return invoke<string[]>("attack_status");
 }
+
+/* -------------------------- captures + wordlists ------------------------- */
+
+export interface CaptureFile {
+  name: string;
+  path: string;
+  size: number;
+  modified: number;
+  has_handshake: boolean;
+}
+
+export async function listCaptures(): Promise<CaptureFile[]> {
+  const invoke = await getInvoke();
+  if (!invoke) return [];
+  return invoke<CaptureFile[]>("list_captures");
+}
+
+export async function deleteCapture(path: string): Promise<void> {
+  const invoke = await requireInvoke();
+  await invoke("delete_capture", { path });
+}
+
+export interface WordlistOpts {
+  charset: string;
+  min: number;
+  max: number;
+  pattern: string;
+  name: string;
+}
+
+/** Generate a wordlist with crunch (runs as the "wordlist" job). Returns path. */
+export async function generateWordlist(opts: WordlistOpts): Promise<string> {
+  const invoke = await requireInvoke();
+  return invoke<string>("generate_wordlist", { ...opts });
+}
