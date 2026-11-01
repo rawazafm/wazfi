@@ -18,6 +18,10 @@ on:
     paths: ["wazfiapp/**"]
   workflow_dispatch:
 
+# Needed so the release step can create/update a GitHub Release on tags.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
