@@ -652,14 +652,17 @@ fn parse_macos_scan(out: &str) -> Vec<Network> {
 fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
     // If the adapter is still in monitor mode (e.g. after an attack), flip it
     // back to managed + NM-managed so it can scan again.
-    if sh("iw", &["dev", iface, "info"])
+    let flipped = sh("iw", &["dev", iface, "info"])
         .map(|s| s.contains("type monitor"))
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    if flipped {
         let _ = sudo_sh(&["ip", "link", "set", iface, "down"]);
         let _ = sudo_sh(&["iw", "dev", iface, "set", "type", "managed"]);
         let _ = sudo_sh(&["ip", "link", "set", iface, "up"]);
         let _ = sudo_sh(&["nmcli", "dev", "set", iface, "managed", "yes"]);
+        // Let the link come up before scanning (iw scan returns EBUSY/ENETDOWN
+        // immediately after a mode change).
+        std::thread::sleep(Duration::from_millis(1800));
     }
     // Prefer NetworkManager (rich, unprivileged); fall back to a privileged iw scan.
     if let Some(out) = sh(
@@ -724,10 +727,22 @@ fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
         }
     }
 
-    // Fallback: privileged iw scan (sudo -n when not root).
-    let out = sudo_sh(&["iw", "dev", iface, "scan"])
-        .ok_or_else(|| format!("scan failed on {iface} — needs root or passwordless sudo"))?;
-    Ok(parse_iw_scan(&out))
+    // Fallback: privileged iw scan (sudo -n when not root). Retry a few times —
+    // a just-reconfigured interface can report "busy" for a second or two.
+    for attempt in 0..4u8 {
+        if let Some(out) = sudo_sh(&["iw", "dev", iface, "scan"]) {
+            let nets = parse_iw_scan(&out);
+            if !nets.is_empty() {
+                return Ok(nets);
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    }
+    Err(format!(
+        "scan found no networks on {iface} — make sure it's up (not busy from an attack), or launch wazfi with sudo"
+    ))
 }
 
 #[cfg(target_os = "linux")]
