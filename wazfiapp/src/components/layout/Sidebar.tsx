@@ -27,8 +27,11 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
           <div className="text-lg font-bold leading-none tracking-tight">
             <span className="text-gradient">wazfi</span>
           </div>
-          <div className="mt-1 text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+          <div className="mt-1 flex items-center gap-1.5 text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
             Audit Suite
+            <span className="rounded bg-muted px-1 py-px font-mono text-[9px] tracking-normal text-muted-foreground/80">
+              v{__APP_VERSION__}
+            </span>
           </div>
         </div>
       </div>
