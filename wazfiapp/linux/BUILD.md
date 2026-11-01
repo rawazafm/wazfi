@@ -63,6 +63,25 @@ src-tauri/target/release/bundle/
 (The exact arch suffix matches the machine you build on — build on ARM64 Parrot
 for an arm64 package.)
 
+## Build in CI (GitHub Actions)
+
+No Linux machine needed — let GitHub build it. The workflow at
+`.github/workflows/build-wazfi.yml` (repo root) builds **amd64 and arm64**
+packages on every push to `main`/`master`, on PRs touching `wazfiapp/`, and via
+"Run workflow".
+
+- **Get the packages:** open the workflow run → **Artifacts** →
+  `wazfi-linux-amd64` / `wazfi-linux-arm64` (each a zip of the `.deb`/`.rpm`/`.AppImage`).
+- **Cut a release:** push a tag and the `.deb`/`.rpm`/`.AppImage` are attached to
+  a GitHub Release automatically:
+  ```bash
+  git tag v0.1.0 && git push origin v0.1.0
+  ```
+- **arm64 runners** (`ubuntu-22.04-arm`, for your Apple Silicon Parrot VM) are
+  free on **public** repos. On a private repo, either use a paid/larger-runner
+  plan, add a self-hosted arm64 runner, or remove the arm64 entry from the
+  matrix.
+
 ## Install
 
 **Debian / Kali / Parrot / Ubuntu:**

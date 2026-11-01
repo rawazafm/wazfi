@@ -1,0 +1,87 @@
+name: build wazfi (Linux)
+
+# Builds the wazfi Linux desktop packages (.deb / .rpm / .AppImage) for
+# amd64 and arm64. On a version tag (v*) it also publishes a GitHub Release.
+#
+# NOTE: the Tauri app lives in the `wazfiapp/` subdirectory of this repo, so all
+# build steps run with working-directory: wazfiapp.
+#
+# arm64: GitHub's `ubuntu-22.04-arm` runners are free for PUBLIC repos. For a
+# private repo you need a paid/larger-runner plan or a self-hosted arm64 runner;
+# otherwise remove the arm64 matrix entry below.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"] # tags are not path-filtered, so releases always build
+  pull_request:
+    paths: ["wazfiapp/**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        working-directory: wazfiapp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wazfiapp/src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci || npm install
+
+      - name: Build
+        run: npm run tauri build
+
+      - name: Collect bundles
+        run: |
+          mkdir -p dist-bundles
+          find src-tauri/target/release/bundle \
+            -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} dist-bundles/ \;
+          ls -la dist-bundles
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazfi-linux-${{ matrix.arch }}
+          path: wazfiapp/dist-bundles/*
+          if-no-files-found: error
+
+      - name: Publish release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wazfiapp/dist-bundles/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
