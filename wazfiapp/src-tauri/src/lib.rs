@@ -1507,18 +1507,36 @@ fn start_crack(
             s.to_uppercase()
         });
 
-    let mut args: Vec<String> = vec!["-w".into(), wordlist];
-    if let Some(b) = &bssid {
-        args.push("-b".into());
-        args.push(b.clone());
-    }
-    args.push(cap);
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    let _ = app.emit(
-        "attack-log",
-        serde_json::json!({ "job": "crack", "line": format!("aircrack-ng {}", args_ref.join(" ")) }),
-    );
-    let child = spawn_streamed(&app, "crack", "aircrack-ng", &args_ref, false)?;
+    let bssid_flag = bssid.as_ref().map(|b| format!("-b {b} ")).unwrap_or_default();
+    let shq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+
+    let child = if wordlist.ends_with(".gz") {
+        // aircrack can't read gzip directly — stream it through zcat.
+        let inner = format!(
+            "zcat {} | aircrack-ng -w - {}{}",
+            shq(&wordlist),
+            bssid_flag,
+            shq(&cap)
+        );
+        let _ = app.emit(
+            "attack-log",
+            serde_json::json!({ "job": "crack", "line": inner.clone() }),
+        );
+        spawn_streamed(&app, "crack", "bash", &["-c", inner.as_str()], false)?
+    } else {
+        let mut args: Vec<String> = vec!["-w".into(), wordlist];
+        if let Some(b) = &bssid {
+            args.push("-b".into());
+            args.push(b.clone());
+        }
+        args.push(cap);
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = app.emit(
+            "attack-log",
+            serde_json::json!({ "job": "crack", "line": format!("aircrack-ng {}", args_ref.join(" ")) }),
+        );
+        spawn_streamed(&app, "crack", "aircrack-ng", &args_ref, false)?
+    };
     state.0.lock().unwrap().insert("crack".into(), child);
     Ok(())
 }
@@ -1541,6 +1559,7 @@ fn attack_status(state: State<AttackState>) -> Vec<String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AttackState::default())
         .invoke_handler(tauri::generate_handler![
             get_system_info,

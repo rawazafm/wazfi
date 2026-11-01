@@ -290,3 +290,16 @@ export async function startCrack(cap: string, wordlist: string): Promise<void> {
   const invoke = await requireInvoke();
   await invoke("start_crack", { cap, wordlist });
 }
+
+/** Open a native file picker to choose a custom wordlist; returns its path. */
+export async function pickWordlist(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const res = await open({
+    multiple: false,
+    directory: false,
+    title: "Choose a wordlist (.txt)",
+    filters: [{ name: "Wordlist", extensions: ["txt", "lst", "dic", "gz"] }],
+  });
+  return typeof res === "string" ? res : null;
+}

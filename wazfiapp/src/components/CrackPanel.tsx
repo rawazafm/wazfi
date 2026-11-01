@@ -1,14 +1,16 @@
 import * as React from "react";
-import { KeyRound, Play, Square, RefreshCw, Check } from "lucide-react";
+import { KeyRound, Play, Square, RefreshCw, Check, Upload } from "lucide-react";
 import { useApp } from "@/store";
 import {
   listCaptures,
   listWordlists,
+  pickWordlist,
   type CaptureFile,
   type WordlistFile,
 } from "@/lib/tauri";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Select } from "@/components/ui/select";
 
 function human(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -23,8 +25,20 @@ export function CrackPanel() {
   const [wls, setWls] = React.useState<WordlistFile[]>([]);
   const [cap, setCap] = React.useState("");
   const [wl, setWl] = React.useState("");
+  const [custom, setCustom] = React.useState<WordlistFile[]>([]);
 
   const running = attacks.includes("crack");
+  const allWls = [...custom, ...wls];
+
+  async function upload() {
+    const path = await pickWordlist();
+    if (!path) return;
+    const name = path.split("/").pop() ?? path;
+    setCustom((c) =>
+      c.some((x) => x.path === path) ? c : [{ name: `${name} (custom)`, path, size: 0 }, ...c],
+    );
+    setWl(path);
+  }
 
   const load = React.useCallback(async () => {
     const [c, w] = await Promise.all([listCaptures(), listWordlists()]);
@@ -69,40 +83,48 @@ export function CrackPanel() {
             <label className="mb-1 block text-[11px] text-muted-foreground">
               Handshake capture
             </label>
-            <select
+            <Select
               value={cap}
               onChange={(e) => setCap(e.target.value)}
               disabled={running}
-              className="h-9 w-full rounded-md border border-input bg-background/60 px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-50"
             >
-              {caps.length === 0 && <option value="">no captures with a handshake</option>}
+              {caps.length === 0 && (
+                <option value="">no captures with a handshake</option>
+              )}
               {caps.map((c) => (
                 <option key={c.path} value={c.path}>
                   {c.name} ({human(c.size)})
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
 
           <div>
-            <label className="mb-1 block text-[11px] text-muted-foreground">
-              Wordlist
-            </label>
-            <select
+            <div className="mb-1 flex items-center justify-between">
+              <label className="text-[11px] text-muted-foreground">Wordlist</label>
+              <button
+                onClick={upload}
+                disabled={running}
+                className="flex items-center gap-1 text-[11px] text-primary hover:underline disabled:opacity-50"
+              >
+                <Upload className="h-3 w-3" /> Upload .txt
+              </button>
+            </div>
+            <Select
               value={wl}
               onChange={(e) => setWl(e.target.value)}
               disabled={running}
-              className="h-9 w-full rounded-md border border-input bg-background/60 px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-50"
             >
-              {wls.length === 0 && (
-                <option value="">no wordlists — generate one above</option>
+              {allWls.length === 0 && (
+                <option value="">no wordlists — generate or upload one</option>
               )}
-              {wls.map((w) => (
+              {allWls.map((w) => (
                 <option key={w.path} value={w.path}>
-                  {w.name} ({human(w.size)})
+                  {w.name}
+                  {w.size ? ` (${human(w.size)})` : ""}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
 
           <div className="flex items-center justify-between">

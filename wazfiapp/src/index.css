@@ -8,6 +8,7 @@
 */
 
 :root {
+  color-scheme: dark;
   --radius: 0.75rem;
 
   --background: 222 47% 5%;
