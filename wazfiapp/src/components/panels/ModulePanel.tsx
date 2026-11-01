@@ -1,6 +1,6 @@
 import * as React from "react";
 import { motion } from "framer-motion";
-import { AlertTriangle, Crosshair, Play, Terminal } from "lucide-react";
+import { AlertTriangle, Crosshair, Play, Square, Terminal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   ACCENT_CLASSES,
@@ -23,6 +23,10 @@ export function ModulePanel({ module }: { module: AppModule }) {
     networks,
     tools,
     log,
+    attacks,
+    launchDeauth,
+    launchCapture,
+    stopAttack,
   } = useApp();
   const [running, setRunning] = React.useState<string | null>(null);
 
@@ -34,29 +38,51 @@ export function ModulePanel({ module }: { module: AppModule }) {
 
   const installed = new Set(tools.filter((t) => t.installed).map((t) => t.name));
 
+  // Actions wired to real execution (the rest are previews for now).
+  function implementedJob(action: AttackAction): "deauth" | "capture" | null {
+    const key = `${module.id}:${action.id}`;
+    if (key === "dos:deauth_aireplay") return "deauth";
+    if (key === "handshake:capture_handshake") return "capture";
+    return null;
+  }
+
   function launch(action: AttackAction) {
-    if (module.needsMonitor && !monitorOk) {
-      log("err", `${module.label}: adapter not in monitor mode`);
-      return;
-    }
+    const job = implementedJob(action);
+
     if (needsTarget && !target) {
       log("err", `${module.label}: select a target network first`);
       return;
     }
+
+    if (job) {
+      // Real execution — the backend puts the adapter into monitor mode itself.
+      if (!selectedIface) {
+        log("err", "select an interface first");
+        return;
+      }
+      if (job === "deauth") {
+        void launchDeauth(selectedIface, target!.bssid, target!.channel);
+      } else {
+        void launchCapture(selectedIface, target!.bssid, target!.channel);
+      }
+      return;
+    }
+
+    // Preview (not yet wired to real execution).
+    if (module.needsMonitor && !monitorOk) {
+      log("err", `${module.label}: adapter not in monitor mode`);
+      return;
+    }
     setRunning(action.id);
     log("cmd", buildCommand(module, action, selectedIface, target?.bssid));
-    log("info", `${action.title} started…`);
     const missing = action.requires.filter((r) => !installed.has(r));
     window.setTimeout(() => {
       if (missing.length) {
-        log(
-          "warn",
-          `missing tools: ${missing.join(", ")} — install them to run live`,
-        );
+        log("warn", `missing tools: ${missing.join(", ")} — install to run`);
       }
-      log("ok", `${action.title}: routine dispatched to airgeddon engine`);
+      log("warn", `${action.title}: preview only — not wired to real execution yet`);
       setRunning(null);
-    }, 1100);
+    }, 900);
   }
 
   const Icon = module.icon;
@@ -146,6 +172,8 @@ export function ModulePanel({ module }: { module: AppModule }) {
             {module.actions.map((action, idx) => {
               const missing = action.requires.filter((r) => !installed.has(r));
               const level = LEVEL_META[action.level];
+              const job = implementedJob(action);
+              const liveRunning = job ? attacks.includes(job) : false;
               return (
                 <motion.div
                   key={action.id}
@@ -161,6 +189,11 @@ export function ModulePanel({ module }: { module: AppModule }) {
                           <Badge className={cn("text-[10px]", level.className)}>
                             {level.label}
                           </Badge>
+                          {job && (
+                            <Badge className="border-primary/30 bg-primary/10 text-[10px] text-primary">
+                              live
+                            </Badge>
+                          )}
                         </div>
                         <p className="mt-0.5 text-xs text-muted-foreground">
                           {action.description}
@@ -182,20 +215,31 @@ export function ModulePanel({ module }: { module: AppModule }) {
                           ))}
                         </div>
                       </div>
-                      <Button
-                        variant={missing.length ? "glass" : "default"}
-                        size="sm"
-                        disabled={running === action.id}
-                        onClick={() => launch(action)}
-                      >
-                        <Play
-                          className={cn(
-                            "h-3.5 w-3.5",
-                            running === action.id && "animate-pulse",
-                          )}
-                        />
-                        {running === action.id ? "Running" : "Launch"}
-                      </Button>
+                      {liveRunning ? (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => job && stopAttack(job)}
+                        >
+                          <Square className="h-3.5 w-3.5" />
+                          Stop
+                        </Button>
+                      ) : (
+                        <Button
+                          variant={missing.length ? "glass" : "default"}
+                          size="sm"
+                          disabled={running === action.id}
+                          onClick={() => launch(action)}
+                        >
+                          <Play
+                            className={cn(
+                              "h-3.5 w-3.5",
+                              running === action.id && "animate-pulse",
+                            )}
+                          />
+                          {running === action.id ? "…" : "Launch"}
+                        </Button>
+                      )}
                     </CardContent>
                   </Card>
                 </motion.div>

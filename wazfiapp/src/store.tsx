@@ -1,5 +1,6 @@
 import * as React from "react";
 import {
+  attackStatus,
   checkPrereqs,
   checkTools,
   detectUsbWifi,
@@ -8,6 +9,9 @@ import {
   listInterfaces,
   scanNetworks,
   setMonitorMode,
+  startCapture,
+  startDeauth,
+  stopAttack as stopAttackCmd,
   isTauri,
   type Network,
   type Prereqs,
@@ -41,6 +45,10 @@ interface AppState {
   installing: boolean;
   canInstall: boolean;
 
+  /** live attacks: job ids currently running ("deauth", "capture") */
+  attacks: string[];
+  lastCapture: string | null;
+
   selectIface: (name: string) => void;
   selectTarget: (id: string | null) => void;
   toggleMonitor: (name: string) => Promise<void>;
@@ -48,6 +56,9 @@ interface AppState {
   log: (level: LogLine["level"], text: string) => void;
   refresh: () => Promise<void>;
   installTools: () => Promise<void>;
+  launchDeauth: (iface: string, bssid: string, channel: number) => Promise<void>;
+  launchCapture: (iface: string, bssid: string, channel: number) => Promise<void>;
+  stopAttack: (job: string) => Promise<void>;
 }
 
 const Ctx = React.createContext<AppState | null>(null);
@@ -67,6 +78,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [prereqs, setPrereqs] = React.useState<Prereqs | null>(null);
   const [usbWifi, setUsbWifi] = React.useState<UsbWifi[]>([]);
   const [installing, setInstalling] = React.useState(false);
+  const [attacks, setAttacks] = React.useState<string[]>([]);
+  const [lastCapture, setLastCapture] = React.useState<string | null>(null);
 
   const log = React.useCallback((level: LogLine["level"], text: string) => {
     const ts = new Date().toLocaleTimeString("en-GB");
@@ -232,6 +245,80 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, [selectedIface, log]);
 
+  // Stream live-attack output and track running jobs.
+  React.useEffect(() => {
+    if (!isTauri()) return;
+    let offLog: (() => void) | undefined;
+    let offExit: (() => void) | undefined;
+    let offHs: (() => void) | undefined;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      offLog = await listen<{ job: string; line: string }>("attack-log", (e) => {
+        const { job, line } = e.payload;
+        if (line?.trim()) log("info", `${job}: ${line}`);
+      });
+      offExit = await listen<{ job: string }>("attack-exit", (e) => {
+        setAttacks((a) => a.filter((j) => j !== e.payload.job));
+        log("warn", `${e.payload.job} stopped`);
+      });
+      offHs = await listen<{ file: string }>("handshake-captured", (e) => {
+        setLastCapture(e.payload.file);
+        log("ok", `handshake captured → ${e.payload.file}`);
+      });
+      // sync any jobs already running (e.g. after a frontend reload)
+      try {
+        setAttacks(await attackStatus());
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      offLog?.();
+      offExit?.();
+      offHs?.();
+    };
+  }, [log]);
+
+  const launchDeauth = React.useCallback(
+    async (iface: string, bssid: string, channel: number) => {
+      log("cmd", `deauth ${bssid} on ch ${channel}`);
+      try {
+        await startDeauth(iface, bssid, channel);
+        setAttacks((a) => (a.includes("deauth") ? a : [...a, "deauth"]));
+      } catch (e) {
+        log("err", `deauth failed: ${String(e)}`);
+      }
+    },
+    [log],
+  );
+
+  const launchCapture = React.useCallback(
+    async (iface: string, bssid: string, channel: number) => {
+      log("cmd", `capture handshake on ${bssid} ch ${channel}`);
+      try {
+        const file = await startCapture(iface, bssid, channel);
+        setAttacks((a) => (a.includes("capture") ? a : [...a, "capture"]));
+        log("info", `writing capture to ${file}`);
+      } catch (e) {
+        log("err", `capture failed: ${String(e)}`);
+      }
+    },
+    [log],
+  );
+
+  const stopAttack = React.useCallback(
+    async (job: string) => {
+      try {
+        await stopAttackCmd(job);
+      } catch (e) {
+        log("err", `stop ${job} failed: ${String(e)}`);
+      }
+      setAttacks((a) => a.filter((j) => j !== job));
+      log("info", `${job} stopped`);
+    },
+    [log],
+  );
+
   const installTools = React.useCallback(async () => {
     if (!prereqs?.pkg_manager) {
       log("err", "no package manager found — wazfi must run on a Linux host (apt/pacman/dnf)");
@@ -270,6 +357,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     usbWifi,
     installing,
     canInstall: !!prereqs?.pkg_manager,
+    attacks,
+    lastCapture,
     selectIface,
     selectTarget,
     toggleMonitor,
@@ -277,6 +366,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     log,
     refresh,
     installTools,
+    launchDeauth,
+    launchCapture,
+    stopAttack,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

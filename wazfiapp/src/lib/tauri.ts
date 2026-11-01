@@ -205,3 +205,35 @@ export async function installTools(targets: string[]): Promise<void> {
   const invoke = await requireInvoke();
   await invoke("install_tools", { targets });
 }
+
+/* ------------------------------ live attacks ----------------------------- */
+
+export async function startDeauth(
+  iface: string,
+  bssid: string,
+  channel: number,
+): Promise<void> {
+  const invoke = await requireInvoke();
+  await invoke("start_deauth", { iface, bssid, channel });
+}
+
+/** Returns the capture file path. */
+export async function startCapture(
+  iface: string,
+  bssid: string,
+  channel: number,
+): Promise<string> {
+  const invoke = await requireInvoke();
+  return invoke<string>("start_capture", { iface, bssid, channel });
+}
+
+export async function stopAttack(job: string): Promise<void> {
+  const invoke = await requireInvoke();
+  await invoke("stop_attack", { job });
+}
+
+export async function attackStatus(): Promise<string[]> {
+  const invoke = await getInvoke();
+  if (!invoke) return [];
+  return invoke<string[]>("attack_status");
+}

