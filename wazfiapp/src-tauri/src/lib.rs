@@ -492,6 +492,7 @@ fn set_monitor_mode(iface: String, enable: bool) -> Result<Vec<WifiInterface>, S
     if enable {
         ensure_monitor(&iface, 0)?;
     } else {
+        kill_attack_tools();
         let _ = sudo_sh(&["ip", "link", "set", &iface, "down"]);
         sudo_sh(&["iw", "dev", &iface, "set", "type", "managed"])
             .ok_or_else(|| "failed to set managed mode (need root or passwordless sudo)".to_string())?;
@@ -656,6 +657,10 @@ fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
         .map(|s| s.contains("type monitor"))
         .unwrap_or(false);
     if flipped {
+        // A leftover airodump/aireplay would immediately force the card back
+        // into monitor on link-up — stop them first.
+        kill_attack_tools();
+        std::thread::sleep(Duration::from_millis(400));
         let _ = sudo_sh(&["ip", "link", "set", iface, "down"]);
         let _ = sudo_sh(&["iw", "dev", iface, "set", "type", "managed"]);
         let _ = sudo_sh(&["ip", "link", "set", iface, "up"]);
@@ -1049,6 +1054,14 @@ fn install_tools(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
 #[derive(Default)]
 struct AttackState(Mutex<HashMap<String, Child>>);
 
+/// Kill any attack tools that could be holding the radio in monitor mode
+/// (e.g. an airodump-ng left running by a capture that wasn't stopped).
+fn kill_attack_tools() {
+    for t in ["airodump-ng", "aireplay-ng", "mdk4"] {
+        let _ = sudo_sh(&["pkill", "-x", t]);
+    }
+}
+
 /// Run a short privileged helper command (sudo -n when not root).
 fn sudo_sh(args: &[&str]) -> Option<String> {
     if args.is_empty() {
@@ -1282,8 +1295,14 @@ pub fn run() {
             stop_attack,
             attack_status
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Don't leave airodump/aireplay running after the app closes.
+            if let tauri::RunEvent::Exit = event {
+                kill_attack_tools();
+            }
+        });
 }
 
 #[cfg(test)]
