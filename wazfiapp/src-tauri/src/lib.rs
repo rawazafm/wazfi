@@ -1,0 +1,1125 @@
+// wazfi backend — a thin, honest bridge over the host system and the
+// airgeddon engine. On Linux it inspects real wireless interfaces and tools;
+// on other platforms it reports what it can and flags that live attacks are
+// unavailable so the UI can switch to preview mode.
+
+use serde::Serialize;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use tauri::{AppHandle, Emitter};
+
+#[derive(Serialize)]
+pub struct SystemInfo {
+    platform: String,
+    os_version: String,
+    arch: String,
+    attack_capable: bool,
+    airgeddon_path: Option<String>,
+    airgeddon_version: Option<String>,
+    hostname: String,
+}
+
+#[derive(Serialize)]
+pub struct WifiInterface {
+    name: String,
+    driver: String,
+    chipset: String,
+    mac: String,
+    mode: String,
+    supports_monitor: bool,
+    up: bool,
+}
+
+#[derive(Serialize)]
+pub struct ToolStatus {
+    name: String,
+    installed: bool,
+    category: String,
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct Network {
+    /// Stable unique id for the UI. On Linux this equals the BSSID; on macOS,
+    /// where BSSIDs are not exposed without Location permission, it is synthetic.
+    id: String,
+    bssid: String,
+    essid: String,
+    channel: u32,
+    power: i32,
+    encryption: String,
+    wps: bool,
+    clients: u32,
+    band: String,
+}
+
+fn sh(cmd: &str, args: &[&str]) -> Option<String> {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+// Standard binary locations, including Homebrew. GUI apps launched from Finder
+// get a minimal PATH, so we check these explicitly.
+const EXTRA_PATHS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
+
+/// A PATH that includes the common locations on top of the inherited one.
+fn augmented_path() -> String {
+    let cur = std::env::var("PATH").unwrap_or_default();
+    let extra = EXTRA_PATHS.join(":");
+    if cur.is_empty() {
+        extra
+    } else {
+        format!("{extra}:{cur}")
+    }
+}
+
+fn which(tool: &str) -> Option<String> {
+    if let Some(s) = sh("which", &[tool]) {
+        let t = s.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    // Fallback: probe standard locations directly (packaged-app PATH is minimal).
+    for dir in EXTRA_PATHS {
+        let cand = format!("{dir}/{tool}");
+        if std::path::Path::new(&cand).exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn find_airgeddon() -> Option<String> {
+    if let Some(p) = which("airgeddon") {
+        return Some(p);
+    }
+    let candidates = [
+        "/usr/share/airgeddon/airgeddon.sh",
+        "/usr/bin/airgeddon.sh",
+        "/opt/airgeddon/airgeddon.sh",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+fn airgeddon_version(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines().take(400) {
+        if let Some(rest) = line.trim().strip_prefix("airgeddon_version=") {
+            return Some(rest.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn get_system_info() -> SystemInfo {
+    let arch = std::env::consts::ARCH.to_string();
+    let os = std::env::consts::OS.to_string();
+
+    let hostname = sh("hostname", &[])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into());
+
+    let (platform, os_version) = match os.as_str() {
+        "macos" => {
+            let ver = sh("sw_vers", &["-productVersion"])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            ("macOS".to_string(), ver)
+        }
+        "linux" => {
+            let pretty = std::fs::read_to_string("/etc/os-release")
+                .ok()
+                .and_then(|c| {
+                    c.lines()
+                        .find(|l| l.starts_with("PRETTY_NAME="))
+                        .map(|l| {
+                            l.trim_start_matches("PRETTY_NAME=")
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                })
+                .unwrap_or_else(|| "Linux".into());
+            ("Linux".to_string(), pretty)
+        }
+        other => (other.to_string(), String::new()),
+    };
+
+    let airgeddon_path = find_airgeddon();
+    let airgeddon_version = airgeddon_path.as_deref().and_then(airgeddon_version);
+
+    SystemInfo {
+        platform,
+        os_version,
+        arch,
+        attack_capable: cfg!(target_os = "linux"),
+        airgeddon_path,
+        airgeddon_version,
+        hostname,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn list_interfaces_impl() -> Vec<WifiInterface> {
+    let mut out = Vec::new();
+    let ports = match sh("networksetup", &["-listallhardwareports"]) {
+        Some(p) => p,
+        None => return out,
+    };
+
+    // Parse blocks separated by blank lines.
+    let mut cur_port = String::new();
+    let mut cur_dev = String::new();
+    let mut cur_mac = String::new();
+    let flush = |port: &str, dev: &str, mac: &str, out: &mut Vec<WifiInterface>| {
+        if port.contains("Wi-Fi") && !dev.is_empty() {
+            let up = sh("ifconfig", &[dev])
+                .map(|s| s.contains("status: active"))
+                .unwrap_or(false);
+            out.push(WifiInterface {
+                name: dev.to_string(),
+                driver: "Apple AirPort".into(),
+                chipset: "Broadcom/Apple Wi-Fi".into(),
+                mac: mac.to_uppercase(),
+                mode: "managed".into(),
+                // macOS userland cannot put the card in airmon-style monitor
+                // mode for airgeddon; be honest about it.
+                supports_monitor: false,
+                up,
+            });
+        }
+    };
+
+    for line in ports.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            flush(&cur_port, &cur_dev, &cur_mac, &mut out);
+            cur_port.clear();
+            cur_dev.clear();
+            cur_mac.clear();
+        } else if let Some(v) = line.strip_prefix("Hardware Port:") {
+            cur_port = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Device:") {
+            cur_dev = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Ethernet Address:") {
+            cur_mac = v.trim().to_string();
+        }
+    }
+    flush(&cur_port, &cur_dev, &cur_mac, &mut out);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn list_interfaces_impl() -> Vec<WifiInterface> {
+    let mut out = Vec::new();
+    let dev = match sh("iw", &["dev"]) {
+        Some(d) => d,
+        None => return out,
+    };
+
+    let mut name = String::new();
+    for line in dev.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("Interface ") {
+            name = v.trim().to_string();
+        } else if l.starts_with("type ") && !name.is_empty() {
+            let mode = l.trim_start_matches("type ").trim().to_string();
+            let driver = std::fs::read_link(format!(
+                "/sys/class/net/{}/device/driver/module",
+                name
+            ))
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "unknown".into());
+            let mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", name))
+                .map(|s| s.trim().to_uppercase())
+                .unwrap_or_default();
+            let up = std::fs::read_to_string(format!("/sys/class/net/{}/operstate", name))
+                .map(|s| s.trim() == "up")
+                .unwrap_or(false);
+            out.push(WifiInterface {
+                name: name.clone(),
+                driver,
+                chipset: "Wireless adapter".into(),
+                mac,
+                mode: if mode == "managed" { "managed".into() } else { mode },
+                supports_monitor: true,
+                up,
+            });
+            name.clear();
+        }
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn list_interfaces_impl() -> Vec<WifiInterface> {
+    Vec::new()
+}
+
+#[tauri::command]
+fn list_interfaces() -> Vec<WifiInterface> {
+    list_interfaces_impl()
+}
+
+#[derive(Serialize, Clone)]
+pub struct UsbWifi {
+    name: String,
+    vendor: String,
+    vendor_id: String,
+    product_id: String,
+    chipset: String,
+    linux_driver: String,
+    /// true when this host has a usable interface for it
+    usable_here: bool,
+    note: String,
+}
+
+/// Known monitor-mode-capable USB Wi-Fi chipsets → (chipset, linux driver).
+fn classify_wifi(vid: u32, pid: u32, product: &str) -> Option<(String, String)> {
+    const TABLE: &[(u32, u32, &str, &str)] = &[
+        (0x0bda, 0x8812, "RTL8812AU", "8812au / realtek-rtl88xxau-dkms"),
+        (0x0bda, 0x881a, "RTL8812AU", "8812au / realtek-rtl88xxau-dkms"),
+        (0x0bda, 0xa81a, "RTL8812AU", "8812au / realtek-rtl88xxau-dkms"),
+        (0x0bda, 0x8813, "RTL8814AU", "8814au"),
+        (0x0bda, 0x8178, "RTL8192CU", "rtl8192cu"),
+        (0x0bda, 0x8187, "RTL8187", "rtl8187"),
+        (0x0cf3, 0x9271, "AR9271 (Atheros)", "ath9k_htc"),
+        (0x148f, 0x5370, "RT5370 (Ralink)", "rt2800usb"),
+        (0x148f, 0x3070, "RT3070 (Ralink)", "rt2800usb"),
+        (0x0e8d, 0x7612, "MT7612U (MediaTek)", "mt76x2u"),
+        (0x0e8d, 0x7601, "MT7601U (MediaTek)", "mt7601u"),
+    ];
+    for &(v, p, chip, drv) in TABLE {
+        if vid == v && pid == p {
+            return Some((chip.to_string(), drv.to_string()));
+        }
+    }
+    // Heuristic fallback: a known Wi-Fi vendor + a wireless-looking product name.
+    let wifi_vendor = matches!(vid, 0x0bda | 0x0cf3 | 0x148f | 0x0e8d | 0x2357 | 0x7392 | 0x13b1);
+    let p = product.to_lowercase();
+    let looks = ["802.11", "wlan", "wireless", "wi-fi", "wifi", "nic"]
+        .iter()
+        .any(|k| p.contains(k));
+    if wifi_vendor && looks {
+        return Some(("Unknown Wi-Fi chipset".to_string(), "chipset-dependent".to_string()));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn detect_usb_wifi_impl() -> Vec<UsbWifi> {
+    let out = match sh_path("ioreg", &["-p", "IOUSB", "-l", "-w", "0"]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let mut devices = Vec::new();
+    let (mut vid, mut pid): (Option<u32>, Option<u32>) = (None, None);
+    let mut product = String::new();
+    let mut vendor = String::new();
+
+    let parse_num = |line: &str| -> Option<u32> {
+        line.split('=').nth(1)?.trim().trim_matches('"').parse::<u32>().ok()
+    };
+    let parse_str = |line: &str| -> String {
+        line.split('=')
+            .nth(1)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_default()
+    };
+
+    let finalize =
+        |vid: &mut Option<u32>, pid: &mut Option<u32>, product: &mut String, vendor: &mut String, devices: &mut Vec<UsbWifi>| {
+            if let (Some(v), Some(p)) = (*vid, *pid) {
+                if let Some((chipset, drv)) = classify_wifi(v, p, product) {
+                    devices.push(UsbWifi {
+                        name: if product.is_empty() { "USB Wi-Fi adapter".into() } else { product.clone() },
+                        vendor: vendor.clone(),
+                        vendor_id: format!("0x{:04x}", v),
+                        product_id: format!("0x{:04x}", p),
+                        chipset,
+                        linux_driver: drv,
+                        usable_here: false, // macOS has no monitor-mode path
+                        note: "Seen on USB but no macOS driver — this is a Linux adapter. Plug it into your engine host (Linux box, Pi, or VM).".into(),
+                    });
+                }
+            }
+            *vid = None;
+            *pid = None;
+            product.clear();
+            vendor.clear();
+        };
+
+    for line in out.lines() {
+        if line.contains("+-o ") && (line.contains("IOUSBHostDevice") || line.contains("IOUSBDevice")) {
+            finalize(&mut vid, &mut pid, &mut product, &mut vendor, &mut devices);
+        } else if line.contains("\"idVendor\" =") {
+            vid = parse_num(line);
+        } else if line.contains("\"idProduct\" =") {
+            pid = parse_num(line);
+        } else if line.contains("\"USB Product Name\" =") {
+            product = parse_str(line);
+        } else if line.contains("\"USB Vendor Name\" =") {
+            vendor = parse_str(line);
+        }
+    }
+    finalize(&mut vid, &mut pid, &mut product, &mut vendor, &mut devices);
+    devices
+}
+
+#[cfg(target_os = "linux")]
+fn detect_usb_wifi_impl() -> Vec<UsbWifi> {
+    let out = match sh_path("lsusb", &[]) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let mut devices = Vec::new();
+    for line in out.lines() {
+        // e.g. "Bus 001 Device 005: ID 0bda:8812 Realtek ... 802.11n NIC"
+        if let Some(idx) = line.find("ID ") {
+            let rest = &line[idx + 3..];
+            let id_part = rest.split_whitespace().next().unwrap_or("");
+            let name = rest[id_part.len()..].trim().to_string();
+            if let Some((vh, ph)) = id_part.split_once(':') {
+                if let (Ok(v), Ok(p)) = (
+                    u32::from_str_radix(vh, 16),
+                    u32::from_str_radix(ph, 16),
+                ) {
+                    if let Some((chipset, drv)) = classify_wifi(v, p, &name) {
+                        devices.push(UsbWifi {
+                            name: if name.is_empty() { "USB Wi-Fi adapter".into() } else { name },
+                            vendor: String::new(),
+                            vendor_id: format!("0x{:04x}", v),
+                            product_id: format!("0x{:04x}", p),
+                            chipset,
+                            linux_driver: drv,
+                            usable_here: true,
+                            note: "Detected. If it's not in monitor mode, load its driver and use airmon-ng.".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    devices
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn detect_usb_wifi_impl() -> Vec<UsbWifi> {
+    Vec::new()
+}
+
+#[tauri::command]
+fn detect_usb_wifi() -> Vec<UsbWifi> {
+    detect_usb_wifi_impl()
+}
+
+#[tauri::command]
+fn check_tools() -> Vec<ToolStatus> {
+    let essential = [
+        "iw", "ip", "awk", "airmon-ng", "airodump-ng", "aircrack-ng", "aireplay-ng",
+        "iwconfig", "ifconfig",
+    ];
+    let optional = [
+        "hashcat", "hcxdumptool", "hcxpcapngtool", "reaver", "bully", "mdk4", "hostapd",
+        "dnsmasq", "lighttpd", "bettercap", "beef", "crunch", "wash", "macchanger",
+        "besside-ng", "pyrit", "openssl", "tshark", "hostapd-wpe",
+    ];
+
+    let mut out = Vec::new();
+    for t in essential {
+        let path = which(t);
+        out.push(ToolStatus {
+            name: t.to_string(),
+            installed: path.is_some(),
+            category: "essential".into(),
+            path,
+        });
+    }
+    for t in optional {
+        let path = which(t);
+        out.push(ToolStatus {
+            name: t.to_string(),
+            installed: path.is_some(),
+            category: "optional".into(),
+            path,
+        });
+    }
+    out
+}
+
+#[tauri::command]
+fn set_monitor_mode(iface: String, enable: bool) -> Result<Vec<WifiInterface>, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("monitor mode control requires Linux + airmon-ng".into());
+    }
+    let action = if enable { "start" } else { "stop" };
+    sh("airmon-ng", &[action, &iface])
+        .ok_or_else(|| format!("airmon-ng {} {} failed (needs root)", action, iface))?;
+    Ok(list_interfaces_impl())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn leading_spaces(s: &str) -> usize {
+    s.chars().take_while(|c| *c == ' ').count()
+}
+
+/// Normalize a macOS/nmcli security string into a short airgeddon-style label.
+fn normalize_security(raw: &str) -> String {
+    let r = raw.to_uppercase();
+    if r.contains("NONE") || r.is_empty() || r == "--" || r == "OPEN" {
+        return "OPN".into();
+    }
+    if r.contains("WEP") {
+        return "WEP".into();
+    }
+    let enterprise = r.contains("ENTERPRISE") || r.contains("802.1X") || r.contains("EAP");
+    let base = if r.contains("WPA3") && r.contains("WPA2") {
+        "WPA2/WPA3"
+    } else if r.contains("WPA3") {
+        "WPA3"
+    } else if r.contains("WPA2") || r.contains("RSN") {
+        "WPA2"
+    } else if r.contains("WPA") {
+        "WPA"
+    } else {
+        return raw.trim().to_string();
+    };
+    if enterprise {
+        format!("{}-EAP", base)
+    } else {
+        base.to_string()
+    }
+}
+
+/// Parse a "Channel: 7 (2GHz, 20MHz)" value into (channel, band).
+fn parse_channel(value: &str) -> (u32, String) {
+    let channel = value
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let band = if value.contains("6GHz") {
+        "6GHz"
+    } else if value.contains("5GHz") {
+        "5GHz"
+    } else {
+        "2.4GHz"
+    };
+    (channel, band.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn scan_impl(_iface: &str) -> Result<Vec<Network>, String> {
+    // system_profiler performs a real scan. macOS redacts SSIDs and hides BSSIDs
+    // unless the calling app holds Location Services permission, but channel,
+    // band, security and signal are real.
+    let out = sh("system_profiler", &["SPAirPortDataType"])
+        .ok_or_else(|| "system_profiler returned no data".to_string())?;
+    let networks = parse_macos_scan(&out);
+    if networks.is_empty() {
+        return Err("no networks found (grant Location Services to Wi-Fi scanning, or check adapter)".into());
+    }
+    Ok(networks)
+}
+
+// Pure parser (separated so it can be unit-tested without a live scan).
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_scan(out: &str) -> Vec<Network> {
+    let mut networks: Vec<Network> = Vec::new();
+    let mut in_networks = false;
+    let mut cur: Option<Network> = None;
+    let mut idx = 0usize;
+
+    let flush = |cur: &mut Option<Network>, networks: &mut Vec<Network>| {
+        if let Some(n) = cur.take() {
+            if n.channel > 0 || n.encryption != "OPN" {
+                networks.push(n);
+            }
+        }
+    };
+
+    for line in out.lines() {
+        let indent = leading_spaces(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if indent <= 10 {
+            // Section header or an interface-level field: decide context.
+            flush(&mut cur, &mut networks);
+            in_networks = trimmed == "Other Local Wi-Fi Networks:"
+                || trimmed == "Current Network Information:";
+            continue;
+        }
+
+        if !in_networks {
+            continue;
+        }
+
+        if indent == 12 && trimmed.ends_with(':') {
+            // New network: the line is its (possibly redacted) name.
+            flush(&mut cur, &mut networks);
+            idx += 1;
+            let name = trimmed.trim_end_matches(':').to_string();
+            let essid = if name.contains("redacted") {
+                "<hidden>".to_string()
+            } else {
+                name
+            };
+            cur = Some(Network {
+                id: format!("wifi-{}", idx),
+                bssid: "n/a (macOS)".into(),
+                essid,
+                channel: 0,
+                power: -100,
+                encryption: "OPN".into(),
+                wps: false,
+                clients: 0,
+                band: "2.4GHz".into(),
+            });
+        } else if indent >= 14 {
+            if let Some(n) = cur.as_mut() {
+                if let Some((key, value)) = trimmed.split_once(": ") {
+                    match key {
+                        "Channel" => {
+                            let (ch, band) = parse_channel(value);
+                            n.channel = ch;
+                            n.band = band;
+                        }
+                        "Security" => n.encryption = normalize_security(value),
+                        "Signal / Noise" => {
+                            if let Some(first) = value.split_whitespace().next() {
+                                if let Ok(p) = first.parse::<i32>() {
+                                    n.power = p;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut cur, &mut networks);
+    networks
+}
+
+#[cfg(target_os = "linux")]
+fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
+    // Prefer NetworkManager (no root, real SSID/BSSID/signal); fall back to iw.
+    if let Some(out) = sh(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "BSSID,SSID,CHAN,SIGNAL,SECURITY,FREQ",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ],
+    ) {
+        let mut networks = Vec::new();
+        for line in out.lines() {
+            // nmcli escapes ':' inside the BSSID as '\:'; split on unescaped ':'.
+            let fields = split_nmcli(line);
+            if fields.len() < 6 {
+                continue;
+            }
+            let bssid = fields[0].replace("\\:", ":").to_uppercase();
+            let essid = if fields[1].is_empty() {
+                "<hidden>".to_string()
+            } else {
+                fields[1].clone()
+            };
+            let channel = fields[2].parse::<u32>().unwrap_or(0);
+            let signal_pct = fields[3].parse::<i32>().unwrap_or(0);
+            let power = signal_pct / 2 - 100; // rough %→dBm
+            let encryption = normalize_security(&fields[4]);
+            let freq = fields[5]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let band = if freq >= 5925 {
+                "6GHz"
+            } else if freq >= 4900 {
+                "5GHz"
+            } else {
+                "2.4GHz"
+            };
+            if bssid.is_empty() {
+                continue;
+            }
+            networks.push(Network {
+                id: bssid.clone(),
+                bssid,
+                essid,
+                channel,
+                power,
+                encryption,
+                wps: false,
+                clients: 0,
+                band: band.to_string(),
+            });
+        }
+        if !networks.is_empty() {
+            return Ok(networks);
+        }
+    }
+
+    // Fallback: iw scan (usually needs root).
+    let out = sh("iw", &["dev", iface, "scan"])
+        .ok_or_else(|| format!("iw scan failed on {} (needs root?)", iface))?;
+    Ok(parse_iw_scan(&out))
+}
+
+#[cfg(target_os = "linux")]
+fn split_nmcli(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                cur.push(next);
+                chars.next();
+            }
+        } else if c == ':' {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn parse_iw_scan(out: &str) -> Vec<Network> {
+    let mut networks = Vec::new();
+    let mut cur: Option<Network> = None;
+    let flush = |cur: &mut Option<Network>, networks: &mut Vec<Network>| {
+        if let Some(n) = cur.take() {
+            networks.push(n);
+        }
+    };
+    for line in out.lines() {
+        let t = line.trim();
+        if t.starts_with("BSS ") {
+            flush(&mut cur, &mut networks);
+            let bssid = t
+                .trim_start_matches("BSS ")
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_uppercase();
+            cur = Some(Network {
+                id: bssid.clone(),
+                bssid,
+                essid: "<hidden>".into(),
+                channel: 0,
+                power: -100,
+                encryption: "OPN".into(),
+                wps: false,
+                clients: 0,
+                band: "2.4GHz".into(),
+            });
+        } else if let Some(n) = cur.as_mut() {
+            if let Some(v) = t.strip_prefix("SSID: ") {
+                if !v.is_empty() {
+                    n.essid = v.to_string();
+                }
+            } else if let Some(v) = t.strip_prefix("signal: ") {
+                if let Some(f) = v.split_whitespace().next() {
+                    if let Ok(p) = f.parse::<f32>() {
+                        n.power = p as i32;
+                    }
+                }
+            } else if let Some(v) = t.strip_prefix("DS Parameter set: channel ") {
+                n.channel = v.trim().parse::<u32>().unwrap_or(0);
+            } else if t.contains("RSN:") {
+                n.encryption = "WPA2".into();
+            } else if t.contains("WPA:") && n.encryption == "OPN" {
+                n.encryption = "WPA".into();
+            } else if t.contains("WPS:") {
+                n.wps = true;
+            }
+        }
+    }
+    flush(&mut cur, &mut networks);
+    networks
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn scan_impl(_iface: &str) -> Result<Vec<Network>, String> {
+    Err("scanning is only implemented for macOS and Linux".into())
+}
+
+#[tauri::command]
+fn scan_networks(iface: String) -> Result<Vec<Network>, String> {
+    scan_impl(&iface)
+}
+
+// --------------------------------------------------------------------------- //
+// --------------------------------------------------------------------------- //
+// Prerequisites + local tool installer (Linux host)
+//
+// wazfi runs natively on the Linux host that holds the wireless adapter. Tools
+// install locally via the host package manager; output streams to the frontend
+// as `install-log` events, finishing with `install-done`.
+// --------------------------------------------------------------------------- //
+
+/// Like `sh`, but resolves the program through `which` (packaged-app PATH) and
+/// runs with an augmented PATH.
+fn sh_path(program: &str, args: &[&str]) -> Option<String> {
+    let resolved = which(program)?;
+    Command::new(resolved)
+        .args(args)
+        .env("PATH", augmented_path())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+#[derive(Serialize, Clone)]
+pub struct Prereqs {
+    os: String,
+    /// host package manager for installing tools (apt/pacman/dnf), if any
+    pkg_manager: Option<String>,
+    is_root: bool,
+}
+
+fn host_pkg_manager() -> Option<String> {
+    for pm in ["apt-get", "pacman", "dnf"] {
+        if which(pm).is_some() {
+            return Some(pm.to_string());
+        }
+    }
+    None
+}
+
+fn is_root() -> bool {
+    sh("id", &["-u"]).map(|s| s.trim() == "0").unwrap_or(false)
+}
+
+#[tauri::command]
+fn check_prereqs() -> Prereqs {
+    Prereqs {
+        os: std::env::consts::OS.to_string(),
+        pkg_manager: host_pkg_manager(),
+        is_root: is_root(),
+    }
+}
+
+fn emit_ev(app: &AppHandle, event: &'static str, level: &str, line: String) {
+    let _ = app.emit(event, serde_json::json!({ "level": level, "line": line }));
+}
+
+/// Run a command, streaming combined stdout/stderr as `event` log entries.
+fn stream_cmd(app: &AppHandle, event: &'static str, program: &str, args: &[&str]) -> bool {
+    emit_ev(app, event, "cmd", format!("{} {}", program, args.join(" ")));
+    let resolved = which(program).unwrap_or_else(|| program.to_string());
+    let mut child = match Command::new(&resolved)
+        .args(args)
+        .env("PATH", augmented_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            emit_ev(app, event, "err", format!("{program}: {e}"));
+            return false;
+        }
+    };
+
+    let mut handles = Vec::new();
+    for (pipe, tag) in [
+        (child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), "out"),
+        (child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>), "err"),
+    ] {
+        if let Some(p) = pipe {
+            let a = app.clone();
+            handles.push(std::thread::spawn(move || {
+                for line in BufReader::new(p).lines().map_while(Result::ok) {
+                    emit_ev(&a, event, tag, line);
+                }
+            }));
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    matches!(child.wait(), Ok(s) if s.success())
+}
+
+/// Map an airgeddon tool name to its distro package. Most are 1:1.
+fn map_package(tool: &str) -> String {
+    match tool {
+        "ip" => "iproute2",
+        "awk" => "gawk",
+        "airmon-ng" | "airodump-ng" | "aireplay-ng" | "besside-ng" => "aircrack-ng",
+        "iwconfig" => "wireless-tools",
+        "ifconfig" => "net-tools",
+        "hcxpcapngtool" => "hcxtools",
+        "wash" => "reaver",
+        "beef" => "beef-xss",
+        other => other,
+    }
+    .to_string()
+}
+
+fn run_install(app: AppHandle, pm: String, targets: Vec<String>) {
+    // Resolve + dedupe packages.
+    let mut pkgs: Vec<String> = Vec::new();
+    for t in &targets {
+        let p = map_package(t);
+        if !pkgs.contains(&p) {
+            pkgs.push(p);
+        }
+    }
+    if pkgs.is_empty() {
+        emit_ev(&app, "install-log", "warn", "nothing to install".into());
+        let _ = app.emit(
+            "install-done",
+            serde_json::json!({ "ok": true, "installed": [], "failed": [] }),
+        );
+        return;
+    }
+
+    let root = is_root();
+    let sudo = !root;
+    emit_ev(
+        &app,
+        "install-log",
+        "info",
+        format!("installing {} package(s) via {}…", pkgs.len(), pm),
+    );
+
+    // Build: [sudo -n] <pm> <op...> <pkgs...>
+    let run = |app: &AppHandle, op: &[&str]| -> bool {
+        let mut full: Vec<&str> = Vec::new();
+        if sudo {
+            full.push("sudo");
+            full.push("-n");
+        }
+        full.push(&pm);
+        full.extend_from_slice(op);
+        let pkg_refs: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+        full.extend_from_slice(&pkg_refs);
+        stream_cmd(app, "install-log", full[0], &full[1..])
+    };
+
+    let ok = match pm.as_str() {
+        "apt-get" => {
+            // refresh indexes first (best-effort), then install
+            let mut upd: Vec<&str> = Vec::new();
+            if sudo {
+                upd.push("sudo");
+                upd.push("-n");
+            }
+            upd.push("apt-get");
+            upd.push("update");
+            stream_cmd(&app, "install-log", upd[0], &upd[1..]);
+            run(&app, &["install", "-y"])
+        }
+        "pacman" => run(&app, &["-S", "--noconfirm"]),
+        "dnf" => run(&app, &["install", "-y"]),
+        _ => false,
+    };
+
+    if !ok && sudo {
+        emit_ev(
+            &app,
+            "install-log",
+            "err",
+            "install failed — need root. Launch wazfi with sudo, or run the install in a root shell.".into(),
+        );
+    }
+    emit_ev(
+        &app,
+        "install-log",
+        if ok { "ok" } else { "err" },
+        format!("install finished — {}", if ok { "success" } else { "failed" }),
+    );
+    let _ = app.emit(
+        "install-done",
+        serde_json::json!({
+            "ok": ok,
+            "installed": if ok { pkgs.clone() } else { Vec::<String>::new() },
+            "failed": if ok { Vec::<String>::new() } else { pkgs },
+        }),
+    );
+}
+
+/// Install airgeddon tools on this Linux host (apt/pacman/dnf). Streams
+/// `install-log` events and finishes with `install-done`.
+#[tauri::command]
+fn install_tools(app: AppHandle, targets: Vec<String>) -> Result<(), String> {
+    let pm = host_pkg_manager().ok_or_else(|| {
+        "no supported package manager (apt/pacman/dnf) found — wazfi must run on a Linux host".to_string()
+    })?;
+    std::thread::spawn(move || run_install(app, pm, targets));
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            get_system_info,
+            list_interfaces,
+            check_tools,
+            set_monitor_mode,
+            scan_networks,
+            detect_usb_wifi,
+            check_prereqs,
+            install_tools
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors real `system_profiler SPAirPortDataType` indentation:
+    // 10 spaces = section header, 12 = network name, 14 = field.
+    const SAMPLE: &str = "\
+      Interfaces:
+        en0:
+          Card Type: Wi-Fi  (0x14E4, 0x4388)
+          Status: Connected
+          Current Network Information:
+            <redacted>:
+              PHY Mode: 802.11ac
+              Channel: 36 (5GHz, 80MHz)
+              Network Type: Infrastructure
+              Security: WPA2 Enterprise
+              Signal / Noise: -64 dBm / -94 dBm
+          Other Local Wi-Fi Networks:
+            <redacted>:
+              PHY Mode: 802.11b/g/n/ac
+              Channel: 7 (2GHz, 20MHz)
+              Network Type: Infrastructure
+              Security: WPA3 Personal
+            <redacted>:
+              PHY Mode: 802.11a/n/ac
+              Channel: 36 (5GHz, 80MHz)
+              Network Type: Infrastructure
+              Security: None
+            <redacted>:
+              PHY Mode: 802.11a/n/ac/ax
+              Channel: 36 (5GHz, 80MHz)
+              Network Type: Infrastructure
+              Security: WPA2/WPA3 Personal
+            HomeNet:
+              PHY Mode: 802.11b/g/n
+              Channel: 1 (2GHz, 20MHz)
+              Network Type: Infrastructure
+              Security: WPA2 Personal
+        awdl0:
+          MAC Address: 1a:2e:08:91:34:ee
+";
+
+    #[test]
+    fn parses_macos_scan() {
+        let nets = parse_macos_scan(SAMPLE);
+        // connected + 4 others
+        assert_eq!(nets.len(), 5, "expected 5 networks, got {}", nets.len());
+
+        // connected network
+        assert_eq!(nets[0].channel, 36);
+        assert_eq!(nets[0].band, "5GHz");
+        assert_eq!(nets[0].encryption, "WPA2-EAP");
+        assert_eq!(nets[0].power, -64);
+        assert_eq!(nets[0].essid, "<hidden>");
+
+        // first "other": WPA3 personal, no signal -> default -100
+        assert_eq!(nets[1].channel, 7);
+        assert_eq!(nets[1].band, "2.4GHz");
+        assert_eq!(nets[1].encryption, "WPA3");
+        assert_eq!(nets[1].power, -100);
+
+        // open network
+        assert_eq!(nets[2].encryption, "OPN");
+
+        // mixed WPA2/WPA3
+        assert_eq!(nets[3].encryption, "WPA2/WPA3");
+
+        // named (non-redacted) network keeps its SSID
+        assert_eq!(nets[4].essid, "HomeNet");
+        assert_eq!(nets[4].encryption, "WPA2");
+
+        // ids are unique
+        let mut ids: Vec<&str> = nets.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "ids must be unique");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "reads real USB devices; run with --ignored"]
+    fn live_usb_wifi() {
+        let devs = detect_usb_wifi_impl();
+        println!("detected {} USB Wi-Fi adapter(s):", devs.len());
+        for d in &devs {
+            println!(
+                "  {} [{}:{}] chipset={} linux={}",
+                d.name, d.vendor_id, d.product_id, d.chipset, d.linux_driver
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "hits the real system_profiler; run with --ignored"]
+    fn live_scan_smoke() {
+        let nets = scan_impl("en0").expect("live scan should succeed");
+        assert!(!nets.is_empty(), "live scan returned no networks");
+        for n in &nets {
+            println!(
+                "ch{:<3} {:<10} {:>4}dBm {}",
+                n.channel, n.encryption, n.power, n.essid
+            );
+        }
+    }
+
+    #[test]
+    fn security_mapping() {
+        assert_eq!(normalize_security("None"), "OPN");
+        assert_eq!(normalize_security("WPA3 Personal"), "WPA3");
+        assert_eq!(normalize_security("WPA2 Enterprise"), "WPA2-EAP");
+        assert_eq!(normalize_security("WPA2/WPA3 Personal"), "WPA2/WPA3");
+        assert_eq!(normalize_security("WPA2 Personal"), "WPA2");
+    }
+}
