@@ -489,9 +489,15 @@ fn set_monitor_mode(iface: String, enable: bool) -> Result<Vec<WifiInterface>, S
     if !cfg!(target_os = "linux") {
         return Err("monitor mode control requires Linux + airmon-ng".into());
     }
-    let action = if enable { "start" } else { "stop" };
-    sh("airmon-ng", &[action, &iface])
-        .ok_or_else(|| format!("airmon-ng {} {} failed (needs root)", action, iface))?;
+    if enable {
+        ensure_monitor(&iface, 0)?;
+    } else {
+        let _ = sudo_sh(&["ip", "link", "set", &iface, "down"]);
+        sudo_sh(&["iw", "dev", &iface, "set", "type", "managed"])
+            .ok_or_else(|| "failed to set managed mode (need root or passwordless sudo)".to_string())?;
+        let _ = sudo_sh(&["ip", "link", "set", &iface, "up"]);
+        let _ = sudo_sh(&["nmcli", "dev", "set", &iface, "managed", "yes"]);
+    }
     Ok(list_interfaces_impl())
 }
 
@@ -644,7 +650,18 @@ fn parse_macos_scan(out: &str) -> Vec<Network> {
 
 #[cfg(target_os = "linux")]
 fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
-    // Prefer NetworkManager (no root, real SSID/BSSID/signal); fall back to iw.
+    // If the adapter is still in monitor mode (e.g. after an attack), flip it
+    // back to managed + NM-managed so it can scan again.
+    if sh("iw", &["dev", iface, "info"])
+        .map(|s| s.contains("type monitor"))
+        .unwrap_or(false)
+    {
+        let _ = sudo_sh(&["ip", "link", "set", iface, "down"]);
+        let _ = sudo_sh(&["iw", "dev", iface, "set", "type", "managed"]);
+        let _ = sudo_sh(&["ip", "link", "set", iface, "up"]);
+        let _ = sudo_sh(&["nmcli", "dev", "set", iface, "managed", "yes"]);
+    }
+    // Prefer NetworkManager (rich, unprivileged); fall back to a privileged iw scan.
     if let Some(out) = sh(
         "nmcli",
         &[
@@ -707,9 +724,9 @@ fn scan_impl(iface: &str) -> Result<Vec<Network>, String> {
         }
     }
 
-    // Fallback: iw scan (usually needs root).
-    let out = sh("iw", &["dev", iface, "scan"])
-        .ok_or_else(|| format!("iw scan failed on {} (needs root?)", iface))?;
+    // Fallback: privileged iw scan (sudo -n when not root).
+    let out = sudo_sh(&["iw", "dev", iface, "scan"])
+        .ok_or_else(|| format!("scan failed on {iface} — needs root or passwordless sudo"))?;
     Ok(parse_iw_scan(&out))
 }
 
